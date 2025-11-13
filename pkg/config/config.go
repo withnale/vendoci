@@ -15,38 +15,66 @@ type Config struct {
 	// Prefix for vendored images (e.g., "vendor")
 	VendorPrefix string `yaml:"vendor_prefix" json:"vendor_prefix"`
 
-	// Images to vendor (legacy, deprecated in favor of groups)
-	Images []ImageConfig `yaml:"images,omitempty" json:"images,omitempty"`
+	// Images to vendor (can be array or map format)
+	// The actual type is determined during unmarshaling
+	Images interface{} `yaml:"images,omitempty" json:"images,omitempty"`
 
-	// Groups of images to vendor
+	// Parsed images from array format
+	ImagesArray []ImageConfig `yaml:"-" json:"-"`
+
+	// Parsed images from map format
+	ImagesMap map[string]ImageConfig `yaml:"-" json:"-"`
+
+	// Groups of images and charts to vendor
 	Groups map[string]GroupConfig `yaml:"groups,omitempty" json:"groups,omitempty"`
 
 	// Registry authentication
 	Auth AuthConfig `yaml:"auth" json:"auth"`
 }
 
-// GroupConfig represents a group of images
+// GroupConfig represents a group of images and charts
 type GroupConfig struct {
-	// Images in this group
-	Images []ImageConfig `yaml:"images" json:"images"`
+	Images []ImageConfig `yaml:"images,omitempty" json:"images,omitempty"`
+	Charts []ChartEntry  `yaml:"charts,omitempty" json:"charts,omitempty"`
+}
+
+// ChartEntry represents a chart within a group
+type ChartEntry struct {
+	Chart   string `yaml:"chart" json:"chart"`
+	Repo    string `yaml:"repo" json:"repo"`
+	Version string `yaml:"version" json:"version"`
 }
 
 // ImageConfig represents a single image source configuration
 type ImageConfig struct {
-	// Source repository (e.g., "docker.io/ubuntu")
-	Source string `yaml:"source" json:"source"`
+	// Source repository (legacy format)
+	Source string `yaml:"source,omitempty" json:"source,omitempty"`
 
-	// Tags to vendor (e.g., ["latest", "20.04", "22.04"])
-	Tags []string `yaml:"tags" json:"tags"`
+	// Repository (new format)
+	Repo string `yaml:"repo,omitempty" json:"repo,omitempty"`
+
+	// Tags to vendor
+	Tags []string `yaml:"tags" json:"tags,omitempty"`
 
 	// Optional: Override the target name transformation
 	TargetOverride string `yaml:"target_override,omitempty" json:"target_override,omitempty"`
 }
 
-// GroupedImage represents an image with its group name
+// ChartConfig represents a single chart source configuration
+type ChartConfig struct {
+	// Repository
+	Repo string `yaml:"repo" json:"repo"`
+
+	// Version to vendor
+	Version string `yaml:"version" json:"version"`
+}
+
+// GroupedImage represents an image with its group name and type
 type GroupedImage struct {
 	GroupName string
 	Image     ImageConfig
+	Type      string // "oci" for container images, "helm" for charts
+	ChartName string // For helm charts, the chart name
 }
 
 // AuthConfig represents registry authentication configuration
@@ -79,6 +107,39 @@ func LoadConfig(filename string) (*Config, error) {
 		return nil, fmt.Errorf("parsing config file: %w", err)
 	}
 
+	// Parse the images field based on its actual type
+	if config.Images != nil {
+		switch images := config.Images.(type) {
+		case []interface{}:
+			// Array format - convert to ImageConfig array
+			for _, item := range images {
+				imgData, err := yaml.Marshal(item)
+				if err != nil {
+					return nil, fmt.Errorf("marshaling image config: %w", err)
+				}
+				var imgCfg ImageConfig
+				if err := yaml.Unmarshal(imgData, &imgCfg); err != nil {
+					return nil, fmt.Errorf("unmarshaling image config: %w", err)
+				}
+				config.ImagesArray = append(config.ImagesArray, imgCfg)
+			}
+		case map[string]interface{}:
+			// Map format - convert to ImageConfig map
+			config.ImagesMap = make(map[string]ImageConfig)
+			for name, value := range images {
+				imgData, err := yaml.Marshal(value)
+				if err != nil {
+					return nil, fmt.Errorf("marshaling image config for %s: %w", name, err)
+				}
+				var imgCfg ImageConfig
+				if err := yaml.Unmarshal(imgData, &imgCfg); err != nil {
+					return nil, fmt.Errorf("unmarshaling image config for %s: %w", name, err)
+				}
+				config.ImagesMap[name] = imgCfg
+			}
+		}
+	}
+
 	// Apply environment variable substitutions
 	if config.Auth.PasswordEnv != "" && config.Auth.Password == "" {
 		config.Auth.Password = os.Getenv(config.Auth.PasswordEnv)
@@ -95,25 +156,72 @@ func LoadConfig(filename string) (*Config, error) {
 	return &config, nil
 }
 
-// GetAllImages returns all images with their group names
+// GetAllImages returns all images and charts with their group names
 func (c *Config) GetAllImages() []GroupedImage {
 	var result []GroupedImage
 
-	// Add images from groups
+	// Add images and charts from groups
 	for groupName, group := range c.Groups {
+		// Add images
 		for _, img := range group.Images {
+			// Normalize the image config - use Repo if Source is empty
+			normalizedImg := img
+			if normalizedImg.Source == "" && normalizedImg.Repo != "" {
+				normalizedImg.Source = normalizedImg.Repo
+			}
+
 			result = append(result, GroupedImage{
 				GroupName: groupName,
-				Image:     img,
+				Image:     normalizedImg,
+				Type:      "oci",
+			})
+		}
+
+		// Add charts as image-like entries
+		for _, chart := range group.Charts {
+			// Convert chart to ImageConfig format
+			// chart.Repo -> source_image, chart.Version -> tag
+			chartAsImage := ImageConfig{
+				Source: chart.Repo,
+				Tags:   []string{chart.Version},
+			}
+
+			result = append(result, GroupedImage{
+				GroupName: groupName,
+				Image:     chartAsImage,
+				Type:      "helm",
+				ChartName: chart.Chart,
 			})
 		}
 	}
 
-	// Add ungrouped images (legacy support)
-	for _, img := range c.Images {
+	// Add ungrouped images from array format (legacy support)
+	for _, img := range c.ImagesArray {
+		// Normalize the image config - use Repo if Source is empty
+		normalizedImg := img
+		if normalizedImg.Source == "" && normalizedImg.Repo != "" {
+			normalizedImg.Source = normalizedImg.Repo
+		}
+
 		result = append(result, GroupedImage{
 			GroupName: "", // No group
-			Image:     img,
+			Image:     normalizedImg,
+			Type:      "oci",
+		})
+	}
+
+	// Add ungrouped images from map format
+	for imageName, img := range c.ImagesMap {
+		// Normalize the image config - use Repo if Source is empty
+		normalizedImg := img
+		if normalizedImg.Source == "" && normalizedImg.Repo != "" {
+			normalizedImg.Source = normalizedImg.Repo
+		}
+
+		result = append(result, GroupedImage{
+			GroupName: imageName, // Use the map key as group name
+			Image:     normalizedImg,
+			Type:      "oci",
 		})
 	}
 
@@ -145,42 +253,8 @@ func transformSourceName(source string) string {
 	return source
 }
 
-// ImageParts represents the components of an image name
-type ImageParts struct {
-	Registry     string
-	Path         string
-	PathSegments []string
-}
-
-// splitImageName splits an image name into registry and path components
-func splitImageName(image string) ImageParts {
-	// Simple implementation - can be enhanced for more complex cases
-	registryPath := image
-
-	// Find the first slash
-	slashIndex := findFirstSlash(registryPath)
-	if slashIndex == -1 {
-		return ImageParts{
-			Registry:     "",
-			Path:         image,
-			PathSegments: []string{image},
-		}
-	}
-
-	registry := registryPath[:slashIndex]
-	path := registryPath[slashIndex+1:]
-
-	// Split path into segments
-	segments := splitBySlash(path)
-
-	return ImageParts{
-		Registry:     registry,
-		Path:         path,
-		PathSegments: segments,
-	}
-}
-
 // Helper functions
+
 func containsRegistry(image string) bool {
 	// Simple heuristic: if it contains a dot before the first slash, assume it's a registry
 	slashIndex := findFirstSlash(image)
@@ -208,30 +282,4 @@ func containsDot(s string) bool {
 		}
 	}
 	return false
-}
-
-func splitBySlash(s string) []string {
-	if s == "" {
-		return []string{}
-	}
-
-	var result []string
-	current := ""
-
-	for _, r := range s {
-		if r == '/' {
-			if current != "" {
-				result = append(result, current)
-				current = ""
-			}
-		} else {
-			current += string(r)
-		}
-	}
-
-	if current != "" {
-		result = append(result, current)
-	}
-
-	return result
 }

@@ -3,7 +3,9 @@ package vendor
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"strings"
 
 	"github.com/google/go-containerregistry/pkg/authn"
@@ -11,6 +13,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/rhodesp/vendoci/pkg/config"
+	"gopkg.in/yaml.v3"
 )
 
 // Vendor handles the vendoring of OCI images
@@ -174,6 +177,70 @@ func (v *Vendor) syncSingleImage(ctx context.Context, imageConfig config.ImageCo
 // CheckImageExists checks if an image exists in a registry (public method)
 func (v *Vendor) CheckImageExists(ctx context.Context, imageRef string) (bool, error) {
 	return v.imageExists(ctx, imageRef)
+}
+
+// HelmRepoIndex represents the structure of a Helm repository index.yaml
+type HelmRepoIndex struct {
+	Entries map[string][]HelmChartVersion `yaml:"entries"`
+}
+
+// HelmChartVersion represents a single version entry in the Helm index
+type HelmChartVersion struct {
+	Version string `yaml:"version"`
+}
+
+// CheckHelmChartExists checks if a Helm chart exists in a repository
+// repoURL should be the Helm repository URL (e.g., "https://charts.jetstack.io")
+// chartName is the chart name (e.g., "cert-manager")
+// version is the chart version (e.g., "v1.15.2")
+func (v *Vendor) CheckHelmChartExists(ctx context.Context, repoURL, chartName, version string) (bool, error) {
+	// Fetch the repository index.yaml
+	indexURL := strings.TrimSuffix(repoURL, "/") + "/index.yaml"
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, indexURL, nil)
+	if err != nil {
+		return false, fmt.Errorf("creating request: %w", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("fetching index: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return false, nil
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
+	// Read and parse the index
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false, fmt.Errorf("reading index: %w", err)
+	}
+
+	var index HelmRepoIndex
+	if err := yaml.Unmarshal(body, &index); err != nil {
+		return false, fmt.Errorf("parsing index: %w", err)
+	}
+
+	// Check if the chart exists
+	chartVersions, exists := index.Entries[chartName]
+	if !exists {
+		return false, nil
+	}
+
+	// Check if the specific version exists
+	for _, cv := range chartVersions {
+		if cv.Version == version {
+			return true, nil
+		}
+	}
+
+	return false, nil
 }
 
 // imageExists checks if an image exists in the target registry

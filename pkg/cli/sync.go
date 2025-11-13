@@ -15,11 +15,11 @@ import (
 )
 
 var (
-	dryRun      bool
-	force       bool
-	configFile  string
-	images      []string
-	tags        []string
+	dryRun     bool
+	force      bool
+	configFile string
+	images     []string
+	tags       []string
 )
 
 // syncCmd represents the sync command
@@ -145,7 +145,9 @@ func validateConfig(cfg *config.Config) error {
 		return fmt.Errorf("target_registry must be specified")
 	}
 
-	if len(cfg.Images) == 0 && len(images) == 0 {
+	// Check if there are any images configured
+	hasImages := len(cfg.ImagesArray) > 0 || len(cfg.ImagesMap) > 0 || len(cfg.Groups) > 0
+	if !hasImages && len(images) == 0 {
 		return fmt.Errorf("no images specified in config or command line")
 	}
 
@@ -155,7 +157,8 @@ func validateConfig(cfg *config.Config) error {
 func overrideConfigWithFlags(cfg *config.Config) *config.Config {
 	// Create new config with command line overrides
 	newCfg := *cfg
-	newCfg.Images = nil
+	newCfg.ImagesArray = nil
+	newCfg.ImagesMap = nil
 
 	// If tags are specified but images aren't, return error
 	if len(tags) > 0 && len(images) == 0 {
@@ -178,7 +181,7 @@ func overrideConfigWithFlags(cfg *config.Config) *config.Config {
 			imageConfig.Tags = []string{"latest"}
 		}
 
-		newCfg.Images = append(newCfg.Images, imageConfig)
+		newCfg.ImagesArray = append(newCfg.ImagesArray, imageConfig)
 	}
 
 	return &newCfg
@@ -191,13 +194,21 @@ func printSyncSummary(cfg *config.Config, opts vendor.SyncOptions) {
 	fmt.Printf("Vendor Prefix: %s\n", cfg.VendorPrefix)
 	fmt.Printf("Dry Run: %t\n", opts.DryRun)
 	fmt.Printf("Force: %t\n", opts.Force)
-	fmt.Printf("Images to sync: %d\n", len(cfg.Images))
+
+	// Count all images from all sources
+	allImages := cfg.GetAllImages()
+	fmt.Printf("Images to sync: %d\n", len(allImages))
 	fmt.Println()
 
 	if opts.Verbose {
 		fmt.Println("Image Details:")
-		for i, img := range cfg.Images {
-			fmt.Printf("  %d. %s (tags: %s)\n", i+1, img.Source, strings.Join(img.Tags, ", "))
+		for i, groupedImg := range allImages {
+			img := groupedImg.Image
+			groupLabel := ""
+			if groupedImg.GroupName != "" {
+				groupLabel = fmt.Sprintf(" [%s]", groupedImg.GroupName)
+			}
+			fmt.Printf("  %d. %s%s (tags: %s)\n", i+1, img.Source, groupLabel, strings.Join(img.Tags, ", "))
 		}
 		fmt.Println()
 	}

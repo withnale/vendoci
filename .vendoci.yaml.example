@@ -15,45 +15,58 @@ auth:
   # Alternative: use token authentication
   # token_env: "VENDOCI_TOKEN"
 
-# Images to vendor
-images:
-  # Example: Ubuntu images
-  - source: "docker.io/ubuntu"
-    tags:
-      - "latest"
-      - "20.04"
-      - "22.04"
+# Images organized by groups (recommended)
+groups:
+  base-images:
+    images:
+      - source: "docker.io/ubuntu"
+        tags:
+          - "latest"
+          - "20.04"
+          - "22.04"
 
-  # Example: Nginx images
-  - source: "docker.io/nginx"
-    tags:
-      - "latest"
-      - "alpine"
-      - "1.25"
+      - source: "docker.io/alpine"
+        tags:
+          - "latest"
+          - "3.19"
 
-  # Example: Redis with custom target name
-  - source: "docker.io/redis"
-    tags:
-      - "latest"
-      - "7-alpine"
-    # Optional: Override the default target name transformation
-    target_override: "redis-cache"
+  web-servers:
+    images:
+      - source: "docker.io/nginx"
+        tags:
+          - "latest"
+          - "alpine"
+          - "1.25"
 
-  # Example: Google container images
-  - source: "gcr.io/google-containers/pause"
-    tags:
-      - "3.8"
-      - "3.9"
+  databases:
+    images:
+      - source: "docker.io/postgres"
+        tags:
+          - "15"
+          - "16"
 
-  # Example: Private registry source
-  - source: "quay.io/prometheus/prometheus"
-    tags:
-      - "latest"
-      - "v2.45.0"
+      - source: "docker.io/redis"
+        tags:
+          - "latest"
+          - "7-alpine"
+        # Optional: Override the default target name transformation
+        target_override: "redis-cache"
+
+  monitoring:
+    images:
+      - source: "quay.io/prometheus/prometheus"
+        tags:
+          - "latest"
+          - "v2.45.0"
+
+# Legacy format (still supported but groups are recommended)
+# images:
+#   - source: "docker.io/ubuntu"
+#     tags:
+#       - "latest"
 
 # Results will be:
-# docker.io/ubuntu:latest -> myregistry.example.com/vendor/docker.io.ubuntu:latest
-# docker.io/nginx:alpine -> myregistry.example.com/vendor/docker.io.nginx:alpine
+# docker.io/ubuntu:latest -> myregistry.example.com/vendor/docker.io/ubuntu:latest
+# docker.io/nginx:alpine -> myregistry.example.com/vendor/docker.io/nginx:alpine
 # docker.io/redis:latest -> myregistry.example.com/vendor/redis-cache:latest
-# gcr.io/google-containers/pause:3.8 -> myregistry.example.com/vendor/gcr.io.google-containers.pause:3.8
-# quay.io/prometheus/prometheus:latest -> myregistry.example.com/vendor/quay.io.prometheus.prometheus:latest
+# quay.io/prometheus/prometheus:latest -> myregistry.example.com/vendor/quay.io/prometheus/prometheus:latest

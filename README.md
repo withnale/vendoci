@@ -12,9 +12,9 @@ VendOCI transforms source image names into a vendored format:
 
 | Source | Target |
 |--------|--------|
-| `docker.io/ubuntu:latest` | `myregistry.com/vendor/docker.io.ubuntu:latest` |
-| `gcr.io/google-containers/pause:3.8` | `myregistry.com/vendor/gcr.io.google-containers.pause:3.8` |
-| `quay.io/prometheus/prometheus:v2.45.0` | `myregistry.com/vendor/quay.io.prometheus.prometheus:v2.45.0` |
+| `docker.io/ubuntu:latest` | `myregistry.com/vendor/docker.io/ubuntu:latest` |
+| `gcr.io/google-containers/pause:3.8` | `myregistry.com/vendor/gcr.io/google-containers/pause:3.8` |
+| `quay.io/prometheus/prometheus:v2.45.0` | `myregistry.com/vendor/quay.io/prometheus/prometheus:v2.45.0` |
 
 ## Installation
 
@@ -66,20 +66,49 @@ See [.vendoci.yaml.example](./.vendoci.yaml.example) for a complete example.
 
 ## Usage
 
-### Basic Sync
+### List Images
+
+List all images and tags defined in your configuration:
+
+```bash
+# Basic listing
+vendoci list
+
+# Show target image names
+vendoci list --show-targets
+```
+
+### Check Image Presence
+
+Check whether source and destination images exist:
+
+```bash
+# Check all images
+vendoci check
+
+# Check with parallel requests for faster results
+vendoci check --parallel 10
+
+# Check with verbose error output
+vendoci check -v
+```
+
+### Sync Images
 
 Sync all images defined in your configuration:
 
 ```bash
+# Basic sync
 vendoci sync
-```
 
-### Dry Run
-
-See what would be synced without actually copying:
-
-```bash
+# Dry run - see what would be synced
 vendoci sync --dry-run
+
+# Force re-sync even if images exist
+vendoci sync --force
+
+# Verbose output
+vendoci sync --verbose
 ```
 
 ### Sync Specific Images
@@ -92,22 +121,6 @@ vendoci sync --images docker.io/ubuntu,docker.io/nginx
 
 # Sync specific images with specific tags
 vendoci sync --images docker.io/ubuntu --tags latest,20.04
-```
-
-### Force Re-sync
-
-Re-sync images even if they already exist in the target:
-
-```bash
-vendoci sync --force
-```
-
-### Verbose Output
-
-Get detailed output during sync:
-
-```bash
-vendoci sync --verbose
 ```
 
 ## Configuration Reference
@@ -183,6 +196,57 @@ images:
 ```
 
 ## Command Reference
+
+### `vendoci list`
+
+Lists all images and tags defined in the configuration file.
+
+**Flags:**
+- `--show-targets`: Show target image names in addition to source images
+- `--config`: Path to configuration file
+- `--verbose, -v`: Verbose output
+
+**Example Output:**
+```
+SOURCE IMAGE       TAG      OVERRIDE
+------------       ---      --------
+docker.io/alpine   3.23.0   -
+                   latest   
+docker.io/ubuntu   22.04    -
+                   24.04    
+
+Total: 2 images, 4 tags
+```
+
+### `vendoci check`
+
+Checks whether source and destination images exist in their respective registries.
+
+**Flags:**
+- `--parallel`: Number of parallel checks to perform (default: 5)
+- `--config`: Path to configuration file
+- `--verbose, -v`: Verbose output including errors
+
+**Example Output:**
+```
+SOURCE IMAGE              TAG      SOURCE    DEST      TARGET IMAGE
+------------              ---      ------    ----      ------------
+docker.io/alpine:3.23.0   3.23.0   PRESENT   MISSING   ghcr.io/myorg/vendor/docker.io/alpine:3.23.0
+docker.io/ubuntu:22.04    22.04    PRESENT   PRESENT   ghcr.io/myorg/vendor/docker.io/ubuntu:22.04
+
+Summary:
+  Both present: 1
+  Source only: 1 (needs sync)
+  Target only: 0 (orphaned)
+  Both missing: 0
+  Total: 2
+```
+
+**Status Values:**
+- `PRESENT`: Image exists and is accessible
+- `MISSING`: Image does not exist
+- `UNKNOWN`: Unable to determine (check errors with `-v`)
+- `ERROR`: Authentication or network error (verbose mode only)
 
 ### `vendoci sync`
 

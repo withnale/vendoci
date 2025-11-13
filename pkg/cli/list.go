@@ -61,14 +61,14 @@ func runList(cmd *cobra.Command, args []string) error {
 
 	// Create table
 	table := tablewriter.NewWriter(os.Stdout)
-	
+
 	// Set headers with uppercase and underscores
 	if showTargets {
-	table.Options(tablewriter.WithHeaderAutoFormat(tw.Off))
-		table.Header("GROUP", "SOURCE_IMAGE", "TAG", "TARGET_IMAGE")
+		table.Options(tablewriter.WithHeaderAutoFormat(tw.Off))
+		table.Header("GROUP", "SOURCE_PATH", "VERSION", "TYPE", "TARGET_PATH")
 	} else {
-	table.Options(tablewriter.WithHeaderAutoFormat(tw.Off))
-		table.Header("GROUP", "SOURCE_IMAGE", "TAG", "OVERRIDE")
+		table.Options(tablewriter.WithHeaderAutoFormat(tw.Off))
+		table.Header("GROUP", "SOURCE_PATH", "VERSION", "TYPE", "OVERRIDE")
 	}
 
 	// List all images and their tags
@@ -77,6 +77,8 @@ func runList(cmd *cobra.Command, args []string) error {
 	for _, groupedImg := range groupedImages {
 		img := groupedImg.Image
 		group := groupedImg.GroupName
+		imgType := groupedImg.Type
+		chartName := groupedImg.ChartName
 		if group == "" {
 			group = "-"
 		}
@@ -85,14 +87,14 @@ func runList(cmd *cobra.Command, args []string) error {
 			// Image with no tags
 			totalImages++
 			if showTargets {
-				targetBase := generateTarget(cfg, img)
-				table.Append(group, img.Source, "(no tags)", targetBase)
+				targetBase := generateTarget(cfg, img, imgType, chartName)
+				table.Append(group, img.Source, "(no tags)", imgType, targetBase)
 			} else {
 				override := img.TargetOverride
 				if override == "" {
 					override = "-"
 				}
-				table.Append(group, img.Source, "(no tags)", override)
+				table.Append(group, img.Source, "(no tags)", imgType, override)
 			}
 		} else {
 			// List each tag
@@ -100,12 +102,12 @@ func runList(cmd *cobra.Command, args []string) error {
 			for i, tag := range img.Tags {
 				totalTags++
 				if showTargets {
-					targetBase := generateTarget(cfg, img)
+					targetBase := generateTarget(cfg, img, imgType, chartName)
 					targetFull := fmt.Sprintf("%s:%s", targetBase, tag)
 					if i == 0 {
-						table.Append(group, img.Source, tag, targetFull)
+						table.Append(group, img.Source, tag, imgType, targetFull)
 					} else {
-						table.Append("", "", tag, targetFull)
+						table.Append("", "", tag, "", targetFull)
 					}
 				} else {
 					override := img.TargetOverride
@@ -113,9 +115,9 @@ func runList(cmd *cobra.Command, args []string) error {
 						override = "-"
 					}
 					if i == 0 {
-						table.Append(group, img.Source, tag, override)
+						table.Append(group, img.Source, tag, imgType, override)
 					} else {
-						table.Append("", "", tag, "")
+						table.Append("", "", tag, "", "")
 					}
 				}
 			}
@@ -163,7 +165,13 @@ func loadConfigForList() (*config.Config, error) {
 	return cfg, nil
 }
 
-func generateTarget(cfg *config.Config, img config.ImageConfig) string {
+func generateTarget(cfg *config.Config, img config.ImageConfig, imgType string, chartName string) string {
+	// For Helm charts, use vendor/charts/{chartName} format
+	if imgType == "helm" {
+		return fmt.Sprintf("%s/%s/charts/%s", cfg.TargetRegistry, cfg.VendorPrefix, chartName)
+	}
+
+	// For OCI images, use existing logic
 	if img.TargetOverride != "" {
 		return fmt.Sprintf("%s/%s/%s", cfg.TargetRegistry, cfg.VendorPrefix, img.TargetOverride)
 	}

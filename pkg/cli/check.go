@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"sync"
 
 	"github.com/olekukonko/tablewriter"
@@ -55,6 +56,8 @@ type ImageCheckResult struct {
 	SourceImage  string
 	TargetImage  string
 	Tag          string
+	Type         string
+	ChartName    string // For helm charts, the chart name
 	SourceExists bool
 	TargetExists bool
 	SourceError  error
@@ -99,13 +102,15 @@ func runCheck(cmd *cobra.Command, args []string) error {
 	for _, groupedImg := range groupedImages {
 		img := groupedImg.Image
 		group := groupedImg.GroupName
+		imgType := groupedImg.Type
+		chartName := groupedImg.ChartName
 		if group == "" {
 			group = "-"
 		}
 
 		for _, tag := range img.Tags {
 			sourceImage := fmt.Sprintf("%s:%s", img.Source, tag)
-			targetBase := generateTarget(cfg, img)
+			targetBase := generateTarget(cfg, img, imgType, chartName)
 			targetImage := fmt.Sprintf("%s:%s", targetBase, tag)
 
 			checks = append(checks, ImageCheckResult{
@@ -113,6 +118,8 @@ func runCheck(cmd *cobra.Command, args []string) error {
 				SourceImage: sourceImage,
 				TargetImage: targetImage,
 				Tag:         tag,
+				Type:        imgType,
+				ChartName:   chartName,
 			})
 		}
 	}
@@ -150,15 +157,28 @@ func performChecks(ctx context.Context, v *vendor.Vendor, checks []ImageCheckRes
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			// Check source image
-			sourceExists, sourceErr := checkImageExists(ctx, v, results[idx].SourceImage)
-			results[idx].SourceExists = sourceExists
-			results[idx].SourceError = sourceErr
+			// Check based on type
+			if results[idx].Type == "helm" {
+				// For helm charts, use CheckHelmChartExists
+				sourceExists, sourceErr := checkHelmChartExists(ctx, v, results[idx].SourceImage, results[idx].ChartName, results[idx].Tag)
+				results[idx].SourceExists = sourceExists
+				results[idx].SourceError = sourceErr
 
-			// Check target image
-			targetExists, targetErr := checkImageExists(ctx, v, results[idx].TargetImage)
-			results[idx].TargetExists = targetExists
-			results[idx].TargetError = targetErr
+				// Target check for helm charts (still uses OCI check as charts are stored as OCI artifacts)
+				targetExists, targetErr := checkImageExists(ctx, v, results[idx].TargetImage)
+				results[idx].TargetExists = targetExists
+				results[idx].TargetError = targetErr
+			} else {
+				// For OCI images, use CheckImageExists
+				sourceExists, sourceErr := checkImageExists(ctx, v, results[idx].SourceImage)
+				results[idx].SourceExists = sourceExists
+				results[idx].SourceError = sourceErr
+
+				// Check target image
+				targetExists, targetErr := checkImageExists(ctx, v, results[idx].TargetImage)
+				results[idx].TargetExists = targetExists
+				results[idx].TargetError = targetErr
+			}
 		}(i)
 	}
 
@@ -170,12 +190,31 @@ func checkImageExists(ctx context.Context, v *vendor.Vendor, imageRef string) (b
 	return v.CheckImageExists(ctx, imageRef)
 }
 
+func checkHelmChartExists(ctx context.Context, v *vendor.Vendor, repoURL, chartName, version string) (bool, error) {
+	// Parse the source to extract just the repo URL
+	// Format is: repoURL:version (e.g., "https://charts.jetstack.io:v1.15.2")
+	// We need to remove the version suffix
+
+	// Remove the version suffix from the URL
+	colonIdx := strings.LastIndex(repoURL, ":")
+	cleanRepoURL := repoURL
+	if colonIdx > 0 {
+		// Make sure this is not part of the URL scheme (http:// or https://)
+		if colonIdx > 8 { // len("https://") = 8
+			cleanRepoURL = repoURL[:colonIdx]
+		}
+	}
+
+	// Check if the chart exists in the repository
+	return v.CheckHelmChartExists(ctx, cleanRepoURL, chartName, version)
+}
+
 func displayCheckResults(results []ImageCheckResult) {
 	table := tablewriter.NewWriter(os.Stdout)
-	
+
 	// Set header with uppercase and underscores
 	table.Options(tablewriter.WithHeaderAutoFormat(tw.Off))
-	table.Header("GROUP", "SOURCE_IMAGE", "TAG", "SOURCE", "DEST", "TARGET_IMAGE")
+	table.Header("GROUP", "SOURCE_PATH", "VERSION", "TYPE", "SOURCE", "DEST", "TARGET_PATH")
 
 	presentCount := 0
 	missingCount := 0
@@ -190,6 +229,7 @@ func displayCheckResults(results []ImageCheckResult) {
 			result.GroupName,
 			result.SourceImage,
 			result.Tag,
+			result.Type,
 			sourceStatus,
 			targetStatus,
 			result.TargetImage,
