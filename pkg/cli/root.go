@@ -18,7 +18,7 @@ var rootCmd = &cobra.Command{
 into your private registry with a structured naming convention.
 
 For example:
-  docker.io/ubuntu:latest -> myrepo/vendor/docker.io.ubuntu:latest`,
+  docker.io/ubuntu:latest -> myrepo/vendor/docker.io/ubuntu:latest`,
 	// Uncomment the following line if your bare application
 	// has an action associated with it:
 	// Run: func(cmd *cobra.Command, args []string) { },

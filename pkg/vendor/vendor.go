@@ -36,12 +36,12 @@ type SyncOptions struct {
 
 // SyncResult represents the result of a sync operation
 type SyncResult struct {
-	Source    string
-	Target    string
-	Tag       string
-	Status    SyncStatus
-	Error     error
-	Skipped   bool
+	Source     string
+	Target     string
+	Tag        string
+	Status     SyncStatus
+	Error      error
+	Skipped    bool
 	SkipReason string
 }
 
@@ -74,10 +74,13 @@ func (s SyncStatus) String() string {
 func (v *Vendor) SyncAll(ctx context.Context, opts SyncOptions) ([]SyncResult, error) {
 	var results []SyncResult
 
-	for _, imageConfig := range v.config.Images {
-		imageResults, err := v.SyncImage(ctx, imageConfig, opts)
+	// Get all images with their groups
+	groupedImages := v.config.GetAllImages()
+
+	for _, groupedImg := range groupedImages {
+		imageResults, err := v.SyncImage(ctx, groupedImg.Image, opts)
 		if err != nil {
-			return results, fmt.Errorf("syncing image %s: %w", imageConfig.Source, err)
+			return results, fmt.Errorf("syncing image %s: %w", groupedImg.Image.Source, err)
 		}
 		results = append(results, imageResults...)
 	}
@@ -168,6 +171,11 @@ func (v *Vendor) syncSingleImage(ctx context.Context, imageConfig config.ImageCo
 	return result
 }
 
+// CheckImageExists checks if an image exists in a registry (public method)
+func (v *Vendor) CheckImageExists(ctx context.Context, imageRef string) (bool, error) {
+	return v.imageExists(ctx, imageRef)
+}
+
 // imageExists checks if an image exists in the target registry
 func (v *Vendor) imageExists(ctx context.Context, imageRef string) (bool, error) {
 	// Parse the image reference
@@ -212,6 +220,9 @@ func (v *Vendor) getCraneOptions() []crane.Option {
 			Password: v.config.Auth.Password,
 		}
 		opts = append(opts, crane.WithAuth(auth))
+	} else {
+		// Fall back to default keychain (Docker credentials)
+		opts = append(opts, crane.WithAuthFromKeychain(authn.DefaultKeychain))
 	}
 
 	return opts
@@ -228,6 +239,9 @@ func (v *Vendor) getRemoteOptions() []remote.Option {
 			Password: v.config.Auth.Password,
 		}
 		opts = append(opts, remote.WithAuth(auth))
+	} else {
+		// Fall back to default keychain (Docker credentials)
+		opts = append(opts, remote.WithAuthFromKeychain(authn.DefaultKeychain))
 	}
 
 	return opts

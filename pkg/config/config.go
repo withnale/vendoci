@@ -15,11 +15,20 @@ type Config struct {
 	// Prefix for vendored images (e.g., "vendor")
 	VendorPrefix string `yaml:"vendor_prefix" json:"vendor_prefix"`
 
-	// Images to vendor
-	Images []ImageConfig `yaml:"images" json:"images"`
+	// Images to vendor (legacy, deprecated in favor of groups)
+	Images []ImageConfig `yaml:"images,omitempty" json:"images,omitempty"`
+
+	// Groups of images to vendor
+	Groups map[string]GroupConfig `yaml:"groups,omitempty" json:"groups,omitempty"`
 
 	// Registry authentication
 	Auth AuthConfig `yaml:"auth" json:"auth"`
+}
+
+// GroupConfig represents a group of images
+type GroupConfig struct {
+	// Images in this group
+	Images []ImageConfig `yaml:"images" json:"images"`
 }
 
 // ImageConfig represents a single image source configuration
@@ -32,6 +41,12 @@ type ImageConfig struct {
 
 	// Optional: Override the target name transformation
 	TargetOverride string `yaml:"target_override,omitempty" json:"target_override,omitempty"`
+}
+
+// GroupedImage represents an image with its group name
+type GroupedImage struct {
+	GroupName string
+	Image     ImageConfig
 }
 
 // AuthConfig represents registry authentication configuration
@@ -80,10 +95,35 @@ func LoadConfig(filename string) (*Config, error) {
 	return &config, nil
 }
 
+// GetAllImages returns all images with their group names
+func (c *Config) GetAllImages() []GroupedImage {
+	var result []GroupedImage
+
+	// Add images from groups
+	for groupName, group := range c.Groups {
+		for _, img := range group.Images {
+			result = append(result, GroupedImage{
+				GroupName: groupName,
+				Image:     img,
+			})
+		}
+	}
+
+	// Add ungrouped images (legacy support)
+	for _, img := range c.Images {
+		result = append(result, GroupedImage{
+			GroupName: "", // No group
+			Image:     img,
+		})
+	}
+
+	return result
+}
+
 // GenerateTargetImage creates the target image name based on the source
 func (c *Config) GenerateTargetImage(source string) string {
-	// Transform source: docker.io/ubuntu -> docker.io.ubuntu
-	// Remove any registry prefix and replace slashes with dots
+	// Transform source: docker.io/ubuntu -> docker.io/ubuntu
+	// Keep the original path structure
 	transformed := transformSourceName(source)
 
 	return fmt.Sprintf("%s/%s/%s", c.TargetRegistry, c.VendorPrefix, transformed)
@@ -91,37 +131,18 @@ func (c *Config) GenerateTargetImage(source string) string {
 
 // transformSourceName converts a source image name to a vendor-friendly format
 // Examples:
-//   docker.io/ubuntu -> docker.io.ubuntu
-//   gcr.io/google-containers/pause -> gcr.io.google-containers.pause
-//   ubuntu -> docker.io.ubuntu (assumes docker.io as default)
+//
+//	docker.io/ubuntu -> docker.io/ubuntu
+//	gcr.io/google-containers/pause -> gcr.io/google-containers/pause
+//	ubuntu -> docker.io/ubuntu (assumes docker.io as default)
 func transformSourceName(source string) string {
 	// If no registry specified, assume docker.io
 	if !containsRegistry(source) {
 		source = "docker.io/" + source
 	}
 
-	// Replace slashes with dots, except for the first one which separates registry from path
-	result := ""
-	parts := splitImageName(source)
-
-	if len(parts.Registry) > 0 {
-		result = parts.Registry
-	}
-
-	if len(parts.Path) > 0 {
-		if result != "" {
-			result += "."
-		}
-		// Replace remaining slashes with dots
-		for i, segment := range parts.PathSegments {
-			if i > 0 {
-				result += "."
-			}
-			result += segment
-		}
-	}
-
-	return result
+	// Keep the original path structure with slashes
+	return source
 }
 
 // ImageParts represents the components of an image name

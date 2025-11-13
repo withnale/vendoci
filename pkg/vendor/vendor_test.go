@@ -137,7 +137,7 @@ func TestTargetImageGeneration(t *testing.T) {
 	}
 
 	source := "docker.io/alpine"
-	expected := "ghcr.io/poptart-testing/poptart/vendor/docker.io.alpine"
+	expected := "ghcr.io/poptart-testing/poptart/vendor/docker.io/alpine"
 
 	result := cfg.GenerateTargetImage(source)
 	if result != expected {
