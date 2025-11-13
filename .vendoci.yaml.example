@@ -1,0 +1,59 @@
+# VendOCI Configuration Example
+# Copy this file to .vendoci.yaml and customize for your environment
+
+# Target registry where images will be vendored
+target_registry: "myregistry.example.com"
+
+# Prefix for vendored images (default: "vendor")
+vendor_prefix: "vendor"
+
+# Authentication for the target registry
+auth:
+  username: "your-username"
+  # Instead of hardcoding password, use environment variable
+  password_env: "VENDOCI_PASSWORD"
+  # Alternative: use token authentication
+  # token_env: "VENDOCI_TOKEN"
+
+# Images to vendor
+images:
+  # Example: Ubuntu images
+  - source: "docker.io/ubuntu"
+    tags:
+      - "latest"
+      - "20.04"
+      - "22.04"
+
+  # Example: Nginx images
+  - source: "docker.io/nginx"
+    tags:
+      - "latest"
+      - "alpine"
+      - "1.25"
+
+  # Example: Redis with custom target name
+  - source: "docker.io/redis"
+    tags:
+      - "latest"
+      - "7-alpine"
+    # Optional: Override the default target name transformation
+    target_override: "redis-cache"
+
+  # Example: Google container images
+  - source: "gcr.io/google-containers/pause"
+    tags:
+      - "3.8"
+      - "3.9"
+
+  # Example: Private registry source
+  - source: "quay.io/prometheus/prometheus"
+    tags:
+      - "latest"
+      - "v2.45.0"
+
+# Results will be:
+# docker.io/ubuntu:latest -> myregistry.example.com/vendor/docker.io.ubuntu:latest
+# docker.io/nginx:alpine -> myregistry.example.com/vendor/docker.io.nginx:alpine
+# docker.io/redis:latest -> myregistry.example.com/vendor/redis-cache:latest
+# gcr.io/google-containers/pause:3.8 -> myregistry.example.com/vendor/gcr.io.google-containers.pause:3.8
+# quay.io/prometheus/prometheus:latest -> myregistry.example.com/vendor/quay.io.prometheus.prometheus:latest

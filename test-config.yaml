@@ -1,0 +1,16 @@
+# Test configuration for alpine image copy to ghcr.io
+target_registry: "ghcr.io/poptart-testing/poptart"
+vendor_prefix: "vendor"
+
+auth:
+  # Use environment variables for authentication
+  username: "poptart-testing"
+  password_env: "GITHUB_TOKEN"
+
+images:
+  - source: "docker.io/alpine"
+    tags:
+      - "3.23.0"
+
+# This will result in:
+# docker.io/alpine:3.23.0 -> ghcr.io/poptart-testing/poptart/vendor/docker.io.alpine:3.23.0
