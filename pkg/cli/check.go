@@ -8,15 +8,17 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/olekukonko/tablewriter"
-	"github.com/olekukonko/tablewriter/tw"
 	"github.com/spf13/cobra"
 
+	"github.com/rhodesp/vendoci/pkg/config"
 	"github.com/rhodesp/vendoci/pkg/vendor"
 )
 
 var (
-	parallel int
+	parallel          int
+	checkFilterType   string
+	errorsOnly        bool
+	checkFilterGroups []string
 )
 
 // checkCmd represents the check command
@@ -39,7 +41,24 @@ Examples:
   vendoci check --parallel 10
 
   # Check with verbose output
-  vendoci check -v`,
+  vendoci check -v
+
+  # Check only OCI images
+  vendoci check --type oci
+
+  # Check only Helm charts
+  vendoci check --type helm
+
+  # Show only images with errors (missing from source or dest)
+  vendoci check --errors
+  vendoci check -E
+
+  # Check only specific groups
+  vendoci check --groups alpine
+  vendoci check -G alpine -G busybox
+
+  # Combine filters
+  vendoci check --type oci --groups alpine --errors`,
 	RunE: runCheck,
 }
 
@@ -48,11 +67,15 @@ func init() {
 
 	// Flags
 	checkCmd.Flags().IntVar(&parallel, "parallel", 5, "Number of parallel checks to perform")
+	checkCmd.Flags().StringVar(&checkFilterType, "type", "", "Filter by type: oci or helm (default: show all)")
+	checkCmd.Flags().BoolVarP(&errorsOnly, "errors", "E", false, "Show only images with errors (missing from source or dest)")
+	checkCmd.Flags().StringSliceVarP(&checkFilterGroups, "groups", "G", []string{}, "Filter by group names (can specify multiple times)")
 }
 
 // ImageCheckResult represents the result of checking an image
 type ImageCheckResult struct {
 	GroupName    string
+	Name         string // Image basename or chart name
 	SourceImage  string
 	TargetImage  string
 	Tag          string
@@ -76,9 +99,27 @@ func runCheck(cmd *cobra.Command, args []string) error {
 	// Get all images with groups
 	groupedImages := cfg.GetAllImages()
 
+	// Filter by groups if specified
+	if len(checkFilterGroups) > 0 {
+		groupedImages = filterImagesByGroups(groupedImages, checkFilterGroups)
+	}
+
+	// Filter by type if specified
+	if checkFilterType != "" {
+		groupedImages = filterImagesByType(groupedImages, checkFilterType)
+	}
+
 	// Check if there are any images configured
 	if len(groupedImages) == 0 {
-		fmt.Println("No images configured in config file")
+		if len(checkFilterGroups) > 0 && checkFilterType != "" {
+			fmt.Printf("No images of type '%s' in groups %v configured in config file\n", checkFilterType, checkFilterGroups)
+		} else if len(checkFilterGroups) > 0 {
+			fmt.Printf("No images in groups %v configured in config file\n", checkFilterGroups)
+		} else if checkFilterType != "" {
+			fmt.Printf("No images of type '%s' configured in config file\n", checkFilterType)
+		} else {
+			fmt.Println("No images configured in config file")
+		}
 		return nil
 	}
 
@@ -108,13 +149,30 @@ func runCheck(cmd *cobra.Command, args []string) error {
 			group = "-"
 		}
 
+		// Determine the name to display
+		var name string
+		if imgType == "helm" {
+			name = chartName
+		} else {
+			name = config.GetImageBasename(img.Source)
+		}
+
 		for _, tag := range img.Tags {
-			sourceImage := fmt.Sprintf("%s:%s", img.Source, tag)
+			// For Helm charts, don't append version to source (it's a repo URL)
+			// For OCI images, append the tag
+			var sourceImage string
+			if imgType == "helm" {
+				sourceImage = img.Source
+			} else {
+				sourceImage = fmt.Sprintf("%s:%s", img.Source, tag)
+			}
+
 			targetBase := generateTarget(cfg, img, imgType, chartName)
 			targetImage := fmt.Sprintf("%s:%s", targetBase, tag)
 
 			checks = append(checks, ImageCheckResult{
 				GroupName:   group,
+				Name:        name,
 				SourceImage: sourceImage,
 				TargetImage: targetImage,
 				Tag:         tag,
@@ -134,8 +192,13 @@ func runCheck(cmd *cobra.Command, args []string) error {
 	// Perform checks in parallel
 	results := performChecks(ctx, v, checks, parallel)
 
+	// Filter results if --errors flag is set
+	if errorsOnly {
+		results = filterErrorResults(results)
+	}
+
 	// Display results
-	displayCheckResults(results)
+	displayCheckResults(results, errorsOnly)
 
 	return nil
 }
@@ -209,12 +272,19 @@ func checkHelmChartExists(ctx context.Context, v *vendor.Vendor, repoURL, chartN
 	return v.CheckHelmChartExists(ctx, cleanRepoURL, chartName, version)
 }
 
-func displayCheckResults(results []ImageCheckResult) {
-	table := tablewriter.NewWriter(os.Stdout)
+func filterErrorResults(results []ImageCheckResult) []ImageCheckResult {
+	var filtered []ImageCheckResult
+	for _, result := range results {
+		// Include if source is missing OR dest is missing (or has error)
+		if !result.SourceExists || !result.TargetExists {
+			filtered = append(filtered, result)
+		}
+	}
+	return filtered
+}
 
-	// Set header with uppercase and underscores
-	table.Options(tablewriter.WithHeaderAutoFormat(tw.Off))
-	table.Header("GROUP", "SOURCE_PATH", "VERSION", "TYPE", "SOURCE", "DEST", "TARGET_PATH")
+func displayCheckResults(results []ImageCheckResult, showingErrorsOnly bool) {
+	table := NewTable("GROUP", "NAME", "SOURCE_PATH", "VERSION", "TYPE", "SOURCE", "DEST", "TARGET_PATH")
 
 	presentCount := 0
 	missingCount := 0
@@ -225,8 +295,9 @@ func displayCheckResults(results []ImageCheckResult) {
 		sourceStatus := formatStatus(result.SourceExists, result.SourceError)
 		targetStatus := formatStatus(result.TargetExists, result.TargetError)
 
-		table.Append(
+		table.AddRow(
 			result.GroupName,
+			result.Name,
 			result.SourceImage,
 			result.Tag,
 			result.Type,
@@ -251,6 +322,9 @@ func displayCheckResults(results []ImageCheckResult) {
 
 	// Summary
 	fmt.Printf("\nSummary:\n")
+	if showingErrorsOnly {
+		fmt.Printf("  Showing only errors (missing images)\n")
+	}
 	fmt.Printf("  Both present: %d\n", presentCount)
 	fmt.Printf("  Source only: %d (needs sync)\n", sourceOnlyCount)
 	fmt.Printf("  Target only: %d (orphaned)\n", targetOnlyCount)

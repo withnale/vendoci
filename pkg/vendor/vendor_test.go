@@ -25,10 +25,14 @@ func TestAlpineImageCopyToGHCR(t *testing.T) {
 			Username: "poptart-testing",
 			Password: githubToken,
 		},
-		Images: []config.ImageConfig{
-			{
-				Source: "docker.io/alpine",
-				Tags:   []string{"3.23.0"},
+		Groups: map[string]config.GroupConfig{
+			"test": {
+				Images: []config.ImageConfig{
+					{
+						Source: "docker.io/alpine",
+						Tags:   []string{"3.23.0"},
+					},
+				},
 			},
 		},
 	}
@@ -48,7 +52,7 @@ func TestAlpineImageCopyToGHCR(t *testing.T) {
 	}
 
 	expectedSource := "docker.io/alpine:3.23.0"
-	expectedTarget := "ghcr.io/poptart-testing/poptart/vendor/docker.io.alpine:3.23.0"
+	expectedTarget := "ghcr.io/poptart-testing/poptart/vendor/docker.io/alpine:3.23.0"
 
 	t.Logf("Testing direct vendor copy: %s -> %s", expectedSource, expectedTarget)
 
@@ -90,10 +94,14 @@ func TestAlpineImageCopyDryRun(t *testing.T) {
 	cfg := &config.Config{
 		TargetRegistry: "ghcr.io/poptart-testing/poptart",
 		VendorPrefix:   "vendor",
-		Images: []config.ImageConfig{
-			{
-				Source: "docker.io/alpine",
-				Tags:   []string{"3.23.0"},
+		Groups: map[string]config.GroupConfig{
+			"test": {
+				Images: []config.ImageConfig{
+					{
+						Source: "docker.io/alpine",
+						Tags:   []string{"3.23.0"},
+					},
+				},
 			},
 		},
 	}
@@ -108,7 +116,7 @@ func TestAlpineImageCopyDryRun(t *testing.T) {
 		Force:   false,
 	}
 
-	expectedTarget := "ghcr.io/poptart-testing/poptart/vendor/docker.io.alpine:3.23.0"
+	expectedTarget := "ghcr.io/poptart-testing/poptart/vendor/docker.io/alpine:3.23.0"
 
 	t.Logf("Testing dry-run vendor copy to: %s", expectedTarget)
 

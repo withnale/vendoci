@@ -4,15 +4,15 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/olekukonko/tablewriter"
-	"github.com/olekukonko/tablewriter/tw"
 	"github.com/spf13/cobra"
 
 	"github.com/rhodesp/vendoci/pkg/config"
 )
 
 var (
-	showTargets bool
+	showTargets  bool
+	filterType   string
+	filterGroups []string
 )
 
 // listCmd represents the list command
@@ -27,7 +27,20 @@ Examples:
   vendoci list
 
   # List with target image names
-  vendoci list --show-targets`,
+  vendoci list --show-targets
+
+  # List only OCI images
+  vendoci list --type oci
+
+  # List only Helm charts
+  vendoci list --type helm
+
+  # List only specific groups
+  vendoci list --groups alpine
+  vendoci list -G alpine -G busybox
+
+  # Combine filters
+  vendoci list --type oci --groups alpine`,
 	RunE: runList,
 }
 
@@ -36,6 +49,8 @@ func init() {
 
 	// Flags
 	listCmd.Flags().BoolVar(&showTargets, "show-targets", false, "Show target image names in addition to source images")
+	listCmd.Flags().StringVar(&filterType, "type", "", "Filter by type: oci or helm (default: show all)")
+	listCmd.Flags().StringSliceVarP(&filterGroups, "groups", "G", []string{}, "Filter by group names (can specify multiple times)")
 }
 
 func runList(cmd *cobra.Command, args []string) error {
@@ -48,9 +63,27 @@ func runList(cmd *cobra.Command, args []string) error {
 	// Get all images with groups
 	groupedImages := cfg.GetAllImages()
 
+	// Filter by groups if specified
+	if len(filterGroups) > 0 {
+		groupedImages = filterImagesByGroups(groupedImages, filterGroups)
+	}
+
+	// Filter by type if specified
+	if filterType != "" {
+		groupedImages = filterImagesByType(groupedImages, filterType)
+	}
+
 	// Check if there are any images configured
 	if len(groupedImages) == 0 {
-		fmt.Println("No images configured in config file")
+		if len(filterGroups) > 0 && filterType != "" {
+			fmt.Printf("No images of type '%s' in groups %v configured in config file\n", filterType, filterGroups)
+		} else if len(filterGroups) > 0 {
+			fmt.Printf("No images in groups %v configured in config file\n", filterGroups)
+		} else if filterType != "" {
+			fmt.Printf("No images of type '%s' configured in config file\n", filterType)
+		} else {
+			fmt.Println("No images configured in config file")
+		}
 		return nil
 	}
 
@@ -60,15 +93,11 @@ func runList(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Vendor Prefix: %s\n\n", cfg.VendorPrefix)
 
 	// Create table
-	table := tablewriter.NewWriter(os.Stdout)
-
-	// Set headers with uppercase and underscores
+	var table *TablePrinter
 	if showTargets {
-		table.Options(tablewriter.WithHeaderAutoFormat(tw.Off))
-		table.Header("GROUP", "SOURCE_PATH", "VERSION", "TYPE", "TARGET_PATH")
+		table = NewTable("GROUP", "NAME", "SOURCE_PATH", "VERSION", "TYPE", "TARGET_PATH")
 	} else {
-		table.Options(tablewriter.WithHeaderAutoFormat(tw.Off))
-		table.Header("GROUP", "SOURCE_PATH", "VERSION", "TYPE", "OVERRIDE")
+		table = NewTable("GROUP", "NAME", "SOURCE_PATH", "VERSION", "TYPE", "OVERRIDE")
 	}
 
 	// List all images and their tags
@@ -83,18 +112,26 @@ func runList(cmd *cobra.Command, args []string) error {
 			group = "-"
 		}
 
+		// Determine the name to display
+		var name string
+		if imgType == "helm" {
+			name = chartName
+		} else {
+			name = config.GetImageBasename(img.Source)
+		}
+
 		if len(img.Tags) == 0 {
 			// Image with no tags
 			totalImages++
 			if showTargets {
 				targetBase := generateTarget(cfg, img, imgType, chartName)
-				table.Append(group, img.Source, "(no tags)", imgType, targetBase)
+				table.AddRow(group, name, img.Source, "(no tags)", imgType, targetBase)
 			} else {
 				override := img.TargetOverride
 				if override == "" {
 					override = "-"
 				}
-				table.Append(group, img.Source, "(no tags)", imgType, override)
+				table.AddRow(group, name, img.Source, "(no tags)", imgType, override)
 			}
 		} else {
 			// List each tag
@@ -105,9 +142,9 @@ func runList(cmd *cobra.Command, args []string) error {
 					targetBase := generateTarget(cfg, img, imgType, chartName)
 					targetFull := fmt.Sprintf("%s:%s", targetBase, tag)
 					if i == 0 {
-						table.Append(group, img.Source, tag, imgType, targetFull)
+						table.AddRow(group, name, img.Source, tag, imgType, targetFull)
 					} else {
-						table.Append("", "", tag, "", targetFull)
+						table.AddRow("", "", "", tag, "", targetFull)
 					}
 				} else {
 					override := img.TargetOverride
@@ -115,9 +152,9 @@ func runList(cmd *cobra.Command, args []string) error {
 						override = "-"
 					}
 					if i == 0 {
-						table.Append(group, img.Source, tag, imgType, override)
+						table.AddRow(group, name, img.Source, tag, imgType, override)
 					} else {
-						table.Append("", "", tag, "", "")
+						table.AddRow("", "", "", tag, "", "")
 					}
 				}
 			}
@@ -135,24 +172,29 @@ func runList(cmd *cobra.Command, args []string) error {
 func loadConfigForList() (*config.Config, error) {
 	// If no config file specified, try to find one
 	if cfgFile == "" {
-		// Try current directory first
-		if _, err := os.Stat(".vendoci.yaml"); err == nil {
-			cfgFile = ".vendoci.yaml"
-		} else if _, err := os.Stat("vendoci.yaml"); err == nil {
-			cfgFile = "vendoci.yaml"
+		// First, check for VENDOCI_CONFIG environment variable
+		if envConfig := os.Getenv("VENDOCI_CONFIG"); envConfig != "" {
+			cfgFile = envConfig
 		} else {
-			// Try home directory
-			home, err := os.UserHomeDir()
-			if err == nil {
-				homeConfig := home + "/.vendoci.yaml"
-				if _, err := os.Stat(homeConfig); err == nil {
-					cfgFile = homeConfig
+			// Try current directory first
+			if _, err := os.Stat(".vendoci.yaml"); err == nil {
+				cfgFile = ".vendoci.yaml"
+			} else if _, err := os.Stat("vendoci.yaml"); err == nil {
+				cfgFile = "vendoci.yaml"
+			} else {
+				// Try home directory
+				home, err := os.UserHomeDir()
+				if err == nil {
+					homeConfig := home + "/.vendoci.yaml"
+					if _, err := os.Stat(homeConfig); err == nil {
+						cfgFile = homeConfig
+					}
 				}
 			}
 		}
 
 		if cfgFile == "" {
-			return nil, fmt.Errorf("no config file found. Use --config to specify one")
+			return nil, fmt.Errorf("no config file found. Use --config flag or set VENDOCI_CONFIG environment variable")
 		}
 	}
 
@@ -176,4 +218,32 @@ func generateTarget(cfg *config.Config, img config.ImageConfig, imgType string, 
 		return fmt.Sprintf("%s/%s/%s", cfg.TargetRegistry, cfg.VendorPrefix, img.TargetOverride)
 	}
 	return cfg.GenerateTargetImage(img.Source)
+}
+
+// filterImagesByType filters grouped images by type (oci or helm)
+func filterImagesByType(images []config.GroupedImage, imageType string) []config.GroupedImage {
+	var filtered []config.GroupedImage
+	for _, img := range images {
+		if img.Type == imageType {
+			filtered = append(filtered, img)
+		}
+	}
+	return filtered
+}
+
+// filterImagesByGroups filters grouped images by group names
+func filterImagesByGroups(images []config.GroupedImage, groups []string) []config.GroupedImage {
+	// Create a map for O(1) lookups
+	groupMap := make(map[string]bool)
+	for _, group := range groups {
+		groupMap[group] = true
+	}
+
+	var filtered []config.GroupedImage
+	for _, img := range images {
+		if groupMap[img.GroupName] {
+			filtered = append(filtered, img)
+		}
+	}
+	return filtered
 }

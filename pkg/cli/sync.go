@@ -15,11 +15,13 @@ import (
 )
 
 var (
-	dryRun     bool
-	force      bool
-	configFile string
-	images     []string
-	tags       []string
+	dryRun           bool
+	force            bool
+	configFile       string
+	images           []string
+	tags             []string
+	syncFilterType   string
+	syncFilterGroups []string
 )
 
 // syncCmd represents the sync command
@@ -42,7 +44,20 @@ Examples:
   vendoci sync --dry-run
 
   # Force re-sync even if images exist
-  vendoci sync --force`,
+  vendoci sync --force
+
+  # Sync only OCI images
+  vendoci sync --type oci
+
+  # Sync only Helm charts
+  vendoci sync --type helm
+
+  # Sync only specific groups
+  vendoci sync --groups alpine
+  vendoci sync -G alpine -G busybox
+
+  # Combine filters
+  vendoci sync --type oci --groups alpine --dry-run`,
 	RunE: runSync,
 }
 
@@ -54,6 +69,8 @@ func init() {
 	syncCmd.Flags().BoolVar(&force, "force", false, "Force re-sync even if target images already exist")
 	syncCmd.Flags().StringSliceVar(&images, "images", []string{}, "Comma-separated list of specific images to sync (overrides config)")
 	syncCmd.Flags().StringSliceVar(&tags, "tags", []string{}, "Comma-separated list of specific tags to sync (requires --images)")
+	syncCmd.Flags().StringVar(&syncFilterType, "type", "", "Filter by type: oci or helm (default: sync all)")
+	syncCmd.Flags().StringSliceVarP(&syncFilterGroups, "groups", "G", []string{}, "Filter by group names (can specify multiple times)")
 
 	// Bind flags to viper
 	viper.BindPFlag("sync.dry-run", syncCmd.Flags().Lookup("dry-run"))
@@ -64,7 +81,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 	ctx := context.Background()
 
 	// Load configuration
-	cfg, err := loadConfigForSync()
+	cfg, configPath, err := loadConfigForSync()
 	if err != nil {
 		return fmt.Errorf("loading configuration: %w", err)
 	}
@@ -77,6 +94,31 @@ func runSync(cmd *cobra.Command, args []string) error {
 	// Override configuration if specific images are provided
 	if len(images) > 0 {
 		cfg = overrideConfigWithFlags(cfg)
+	}
+
+	// Filter by groups if specified (unless using --images override)
+	if len(syncFilterGroups) > 0 && len(images) == 0 {
+		cfg = filterConfigByGroups(cfg, syncFilterGroups)
+	}
+
+	// Filter by type if specified (unless using --images override)
+	if syncFilterType != "" && len(images) == 0 {
+		cfg = filterConfigByType(cfg, syncFilterType)
+	}
+
+	// Check if we have any images left after filtering
+	if len(images) == 0 {
+		groupedImages := cfg.GetAllImages()
+		if len(groupedImages) == 0 {
+			if len(syncFilterGroups) > 0 && syncFilterType != "" {
+				fmt.Printf("No images of type '%s' in groups %v to sync\n", syncFilterType, syncFilterGroups)
+			} else if len(syncFilterGroups) > 0 {
+				fmt.Printf("No images in groups %v to sync\n", syncFilterGroups)
+			} else if syncFilterType != "" {
+				fmt.Printf("No images of type '%s' to sync\n", syncFilterType)
+			}
+			return nil
+		}
 	}
 
 	// Create logger
@@ -96,7 +138,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 	}
 
 	// Print configuration summary
-	printSyncSummary(cfg, opts)
+	printSyncSummary(cfg, configPath, opts)
 
 	// Perform sync
 	results, err := v.SyncAll(ctx, opts)
@@ -110,34 +152,40 @@ func runSync(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func loadConfigForSync() (*config.Config, error) {
-	// Try to get config file from viper
-	configPath := viper.GetString("config")
+func loadConfigForSync() (*config.Config, string, error) {
+	// Use the global cfgFile variable set by the --config flag
+	configPath := cfgFile
 
 	// If no config file specified, try default locations
 	if configPath == "" {
-		// Try current directory first
-		if _, err := os.Stat(".vendoci.yaml"); err == nil {
-			configPath = ".vendoci.yaml"
-		} else if _, err := os.Stat("vendoci.yaml"); err == nil {
-			configPath = "vendoci.yaml"
+		// First, check for VENDOCI_CONFIG environment variable
+		if envConfig := os.Getenv("VENDOCI_CONFIG"); envConfig != "" {
+			configPath = envConfig
 		} else {
-			// Try home directory
-			home, err := os.UserHomeDir()
-			if err == nil {
-				homeConfig := home + "/.vendoci.yaml"
-				if _, err := os.Stat(homeConfig); err == nil {
-					configPath = homeConfig
+			// Try current directory first
+			if _, err := os.Stat(".vendoci.yaml"); err == nil {
+				configPath = ".vendoci.yaml"
+			} else if _, err := os.Stat("vendoci.yaml"); err == nil {
+				configPath = "vendoci.yaml"
+			} else {
+				// Try home directory
+				home, err := os.UserHomeDir()
+				if err == nil {
+					homeConfig := home + "/.vendoci.yaml"
+					if _, err := os.Stat(homeConfig); err == nil {
+						configPath = homeConfig
+					}
 				}
 			}
 		}
 	}
 
 	if configPath == "" {
-		return nil, fmt.Errorf("no configuration file found. Please create .vendoci.yaml or specify --config")
+		return nil, "", fmt.Errorf("no configuration file found. Please create .vendoci.yaml, specify --config, or set VENDOCI_CONFIG environment variable")
 	}
 
-	return config.LoadConfig(configPath)
+	cfg, err := config.LoadConfig(configPath)
+	return cfg, configPath, err
 }
 
 func validateConfig(cfg *config.Config) error {
@@ -187,9 +235,57 @@ func overrideConfigWithFlags(cfg *config.Config) *config.Config {
 	return &newCfg
 }
 
-func printSyncSummary(cfg *config.Config, opts vendor.SyncOptions) {
+// filterConfigByType filters the config to only include images of the specified type
+func filterConfigByType(cfg *config.Config, imageType string) *config.Config {
+	newCfg := *cfg
+	newCfg.Groups = make(map[string]config.GroupConfig)
+
+	for groupName, group := range cfg.Groups {
+		newGroup := config.GroupConfig{}
+
+		// OCI images are in the Images array
+		if imageType == "oci" {
+			newGroup.Images = group.Images
+		}
+
+		// Helm charts are in the Charts array
+		if imageType == "helm" {
+			newGroup.Charts = group.Charts
+		}
+
+		// Only add group if it has items
+		if len(newGroup.Images) > 0 || len(newGroup.Charts) > 0 {
+			newCfg.Groups[groupName] = newGroup
+		}
+	}
+
+	return &newCfg
+}
+
+// filterConfigByGroups filters the config to only include specified groups
+func filterConfigByGroups(cfg *config.Config, groups []string) *config.Config {
+	newCfg := *cfg
+	newCfg.Groups = make(map[string]config.GroupConfig)
+
+	// Create a map for O(1) lookups
+	groupMap := make(map[string]bool)
+	for _, group := range groups {
+		groupMap[group] = true
+	}
+
+	for groupName, group := range cfg.Groups {
+		if groupMap[groupName] {
+			newCfg.Groups[groupName] = group
+		}
+	}
+
+	return &newCfg
+}
+
+func printSyncSummary(cfg *config.Config, configPath string, opts vendor.SyncOptions) {
 	fmt.Printf("VendOCI Sync Summary\n")
 	fmt.Printf("===================\n")
+	fmt.Printf("Configuration: %s\n", configPath)
 	fmt.Printf("Target Registry: %s\n", cfg.TargetRegistry)
 	fmt.Printf("Vendor Prefix: %s\n", cfg.VendorPrefix)
 	fmt.Printf("Dry Run: %t\n", opts.DryRun)

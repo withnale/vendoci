@@ -14,6 +14,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/rhodesp/vendoci/pkg/config"
 	"gopkg.in/yaml.v3"
+	"helm.sh/helm/v3/pkg/registry"
 )
 
 // Vendor handles the vendoring of OCI images
@@ -73,7 +74,7 @@ func (s SyncStatus) String() string {
 	}
 }
 
-// SyncAll syncs all images defined in the configuration
+// SyncAll syncs all images and charts defined in the configuration
 func (v *Vendor) SyncAll(ctx context.Context, opts SyncOptions) ([]SyncResult, error) {
 	var results []SyncResult
 
@@ -81,9 +82,20 @@ func (v *Vendor) SyncAll(ctx context.Context, opts SyncOptions) ([]SyncResult, e
 	groupedImages := v.config.GetAllImages()
 
 	for _, groupedImg := range groupedImages {
-		imageResults, err := v.SyncImage(ctx, groupedImg.Image, opts)
+		var imageResults []SyncResult
+		var err error
+
+		// Handle based on type
+		if groupedImg.Type == "helm" {
+			// Sync Helm chart
+			imageResults, err = v.SyncHelmChart(ctx, groupedImg, opts)
+		} else {
+			// Sync OCI image
+			imageResults, err = v.SyncImage(ctx, groupedImg.Image, opts)
+		}
+
 		if err != nil {
-			return results, fmt.Errorf("syncing image %s: %w", groupedImg.Image.Source, err)
+			return results, fmt.Errorf("syncing %s %s: %w", groupedImg.Type, groupedImg.Image.Source, err)
 		}
 		results = append(results, imageResults...)
 	}
@@ -174,6 +186,192 @@ func (v *Vendor) syncSingleImage(ctx context.Context, imageConfig config.ImageCo
 	return result
 }
 
+// SyncHelmChart syncs a Helm chart from a Helm repository to the target registry as an OCI artifact
+func (v *Vendor) SyncHelmChart(ctx context.Context, groupedImg config.GroupedImage, opts SyncOptions) ([]SyncResult, error) {
+	var results []SyncResult
+
+	chartName := groupedImg.ChartName
+	img := groupedImg.Image
+
+	for _, version := range img.Tags {
+		result := v.syncSingleHelmChart(ctx, img.Source, chartName, version, opts)
+		results = append(results, result)
+
+		if result.Status == SyncStatusFailed && opts.Verbose {
+			v.logger.Printf("Failed to sync chart %s:%s: %v", chartName, version, result.Error)
+		}
+	}
+
+	return results, nil
+}
+
+// syncSingleHelmChart syncs a single Helm chart version
+func (v *Vendor) syncSingleHelmChart(ctx context.Context, repoURL, chartName, version string, opts SyncOptions) SyncResult {
+	sourceRef := fmt.Sprintf("%s:%s", repoURL, version)
+
+	// Generate target OCI reference: {registry}/{vendor-prefix}/charts/{chartName}:{version}
+	targetBase := fmt.Sprintf("%s/%s/charts/%s", v.config.TargetRegistry, v.config.VendorPrefix, chartName)
+	targetRef := fmt.Sprintf("%s:%s", targetBase, version)
+
+	result := SyncResult{
+		Source: sourceRef,
+		Target: targetRef,
+		Tag:    version,
+		Status: SyncStatusPending,
+	}
+
+	if opts.Verbose {
+		v.logger.Printf("Syncing Helm chart %s version %s -> %s", chartName, version, targetRef)
+	}
+
+	// Check if target already exists (unless force is specified)
+	if !opts.Force {
+		exists, err := v.imageExists(ctx, targetRef)
+		if err != nil {
+			if opts.Verbose {
+				v.logger.Printf("Warning: Could not check if target exists: %v", err)
+			}
+		} else if exists {
+			result.Status = SyncStatusSkipped
+			result.Skipped = true
+			result.SkipReason = "Chart already exists (use --force to override)"
+			if opts.Verbose {
+				v.logger.Printf("Skipping %s (already exists)", targetRef)
+			}
+			return result
+		}
+	}
+
+	// Dry run - just simulate
+	if opts.DryRun {
+		result.Status = SyncStatusSuccess
+		v.logger.Printf("DRY RUN: Would sync chart %s version %s -> %s", chartName, version, targetRef)
+		return result
+	}
+
+	// Download chart to memory and push as OCI artifact
+	err := v.syncHelmChartToOCI(ctx, repoURL, chartName, version, targetRef)
+	if err != nil {
+		result.Status = SyncStatusFailed
+		result.Error = err
+		return result
+	}
+
+	result.Status = SyncStatusSuccess
+	if opts.Verbose {
+		v.logger.Printf("Successfully synced chart %s -> %s", chartName, targetRef)
+	}
+
+	return result
+}
+
+// syncHelmChartToOCI downloads a Helm chart from a repository and pushes it to the target as an OCI artifact
+func (v *Vendor) syncHelmChartToOCI(ctx context.Context, repoURL, chartName, version string, targetRef string) error {
+	// Step 1: Fetch the Helm repository index to find the chart URL
+	indexURL := strings.TrimSuffix(repoURL, "/") + "/index.yaml"
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, indexURL, nil)
+	if err != nil {
+		return fmt.Errorf("creating index request: %w", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("fetching index: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("index fetch failed with status %d", resp.StatusCode)
+	}
+
+	// Parse the index
+	indexData, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("reading index: %w", err)
+	}
+
+	var index HelmRepoIndex
+	if err := yaml.Unmarshal(indexData, &index); err != nil {
+		return fmt.Errorf("parsing index: %w", err)
+	}
+
+	// Step 2: Find the chart version and get its download URL
+	chartVersions, exists := index.Entries[chartName]
+	if !exists {
+		return fmt.Errorf("chart %s not found in repository", chartName)
+	}
+
+	var chartURL string
+	for _, cv := range chartVersions {
+		if cv.Version == version {
+			if len(cv.URLs) > 0 {
+				chartURL = cv.URLs[0]
+			}
+			break
+		}
+	}
+
+	if chartURL == "" {
+		return fmt.Errorf("chart %s version %s not found or has no download URL", chartName, version)
+	}
+
+	// Make URL absolute if it's relative
+	if !strings.HasPrefix(chartURL, "http://") && !strings.HasPrefix(chartURL, "https://") {
+		chartURL = strings.TrimSuffix(repoURL, "/") + "/" + strings.TrimPrefix(chartURL, "/")
+	}
+
+	// Step 3: Download the chart .tgz file to memory
+	chartReq, err := http.NewRequestWithContext(ctx, http.MethodGet, chartURL, nil)
+	if err != nil {
+		return fmt.Errorf("creating chart download request: %w", err)
+	}
+
+	chartResp, err := http.DefaultClient.Do(chartReq)
+	if err != nil {
+		return fmt.Errorf("downloading chart: %w", err)
+	}
+	defer chartResp.Body.Close()
+
+	if chartResp.StatusCode != http.StatusOK {
+		return fmt.Errorf("chart download failed with status %d", chartResp.StatusCode)
+	}
+
+	// Read chart data into memory
+	chartData, err := io.ReadAll(chartResp.Body)
+	if err != nil {
+		return fmt.Errorf("reading chart data: %w", err)
+	}
+
+	// Step 4: Push the chart to OCI registry using Helm's native registry client
+	// Create Helm registry client
+	helmClient, err := registry.NewClient()
+	if err != nil {
+		return fmt.Errorf("creating Helm registry client: %w", err)
+	}
+
+	// Configure authentication if available
+	if v.config.Auth.Username != "" && v.config.Auth.Password != "" {
+		helmClient, err = registry.NewClient(
+			registry.ClientOptBasicAuth(v.config.Auth.Username, v.config.Auth.Password),
+		)
+		if err != nil {
+			return fmt.Errorf("creating Helm registry client with auth: %w", err)
+		}
+	}
+
+	// Push chart to OCI registry using Helm's Push method
+	// The target ref should be in OCI format: oci://{registry}/{path}
+	ociRef := fmt.Sprintf("oci://%s", targetRef)
+
+	_, err = helmClient.Push(chartData, ociRef)
+	if err != nil {
+		return fmt.Errorf("pushing chart to OCI registry: %w", err)
+	}
+
+	return nil
+}
+
 // CheckImageExists checks if an image exists in a registry (public method)
 func (v *Vendor) CheckImageExists(ctx context.Context, imageRef string) (bool, error) {
 	return v.imageExists(ctx, imageRef)
@@ -186,7 +384,8 @@ type HelmRepoIndex struct {
 
 // HelmChartVersion represents a single version entry in the Helm index
 type HelmChartVersion struct {
-	Version string `yaml:"version"`
+	Version string   `yaml:"version"`
+	URLs    []string `yaml:"urls"`
 }
 
 // CheckHelmChartExists checks if a Helm chart exists in a repository
@@ -312,4 +511,75 @@ func (v *Vendor) getRemoteOptions() []remote.Option {
 	}
 
 	return opts
+}
+
+// ListTargetImages lists all images in the target registry under the vendor prefix
+func (v *Vendor) ListTargetImages(ctx context.Context) ([]string, error) {
+	var images []string
+
+	// Use crane's Catalog function which properly handles authentication
+	repos, err := crane.Catalog(v.config.TargetRegistry, v.getCraneOptions()...)
+	if err != nil {
+		return nil, fmt.Errorf("listing catalog: %w", err)
+	}
+
+	// Filter repositories that start with vendor prefix
+	vendorPrefix := v.config.VendorPrefix + "/"
+	for _, repo := range repos {
+		if strings.HasPrefix(repo, vendorPrefix) {
+			// For each repository, list all tags
+			repoImages, err := v.listRepositoryTags(ctx, repo)
+			if err != nil {
+				v.logger.Printf("Warning: Could not list tags for %s: %v", repo, err)
+				continue
+			}
+			images = append(images, repoImages...)
+		}
+	}
+
+	return images, nil
+}
+
+// listRepositoryTags lists all tags for a specific repository
+func (v *Vendor) listRepositoryTags(ctx context.Context, repo string) ([]string, error) {
+	var images []string
+
+	// Use crane's ListTags function which properly handles authentication
+	fullRepo := fmt.Sprintf("%s/%s", v.config.TargetRegistry, repo)
+	tags, err := crane.ListTags(fullRepo, v.getCraneOptions()...)
+	if err != nil {
+		return nil, fmt.Errorf("listing tags for %s: %w", repo, err)
+	}
+
+	// Build full image references
+	for _, tag := range tags {
+		imageRef := fmt.Sprintf("%s:%s", fullRepo, tag)
+		images = append(images, imageRef)
+	}
+
+	return images, nil
+}
+
+// DeleteImage deletes an image from the target registry
+func (v *Vendor) DeleteImage(ctx context.Context, imageRef string) error {
+	// Parse the image reference
+	ref, err := name.ParseReference(imageRef)
+	if err != nil {
+		return fmt.Errorf("parsing image reference: %w", err)
+	}
+
+	// Get the manifest digest first (required for deletion)
+	desc, err := remote.Get(ref, v.getRemoteOptions()...)
+	if err != nil {
+		return fmt.Errorf("getting manifest: %w", err)
+	}
+
+	// Delete using the digest
+	err = remote.Delete(ref, v.getRemoteOptions()...)
+	if err != nil {
+		return fmt.Errorf("deleting image: %w", err)
+	}
+
+	v.logger.Printf("Deleted %s (digest: %s)", imageRef, desc.Digest)
+	return nil
 }
