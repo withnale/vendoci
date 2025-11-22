@@ -6,7 +6,9 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/crane"
@@ -75,11 +77,18 @@ func (s SyncStatus) String() string {
 }
 
 // SyncAll syncs all images and charts defined in the configuration
+// If requestedGroups is provided, only syncs those groups regardless of sync flag
+// Otherwise, syncs only groups where sync is true (or not specified)
 func (v *Vendor) SyncAll(ctx context.Context, opts SyncOptions) ([]SyncResult, error) {
+	return v.SyncAllWithGroups(ctx, opts, nil)
+}
+
+// SyncAllWithGroups syncs images and charts with optional group filtering
+func (v *Vendor) SyncAllWithGroups(ctx context.Context, opts SyncOptions, requestedGroups []string) ([]SyncResult, error) {
 	var results []SyncResult
 
-	// Get all images with their groups
-	groupedImages := v.config.GetAllImages()
+	// Get all images with their groups, respecting sync flags and group filters
+	groupedImages := v.config.GetAllImagesFiltered(requestedGroups)
 
 	for _, groupedImg := range groupedImages {
 		var imageResults []SyncResult
@@ -275,7 +284,8 @@ func (v *Vendor) syncHelmChartToOCI(ctx context.Context, repoURL, chartName, ver
 		return fmt.Errorf("creating index request: %w", err)
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	client := v.getProxiedHTTPClient()
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("fetching index: %w", err)
 	}
@@ -327,7 +337,8 @@ func (v *Vendor) syncHelmChartToOCI(ctx context.Context, repoURL, chartName, ver
 		return fmt.Errorf("creating chart download request: %w", err)
 	}
 
-	chartResp, err := http.DefaultClient.Do(chartReq)
+	client = v.getProxiedHTTPClient()
+	chartResp, err := client.Do(chartReq)
 	if err != nil {
 		return fmt.Errorf("downloading chart: %w", err)
 	}
@@ -401,7 +412,8 @@ func (v *Vendor) CheckHelmChartExists(ctx context.Context, repoURL, chartName, v
 		return false, fmt.Errorf("creating request: %w", err)
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	client := v.getProxiedHTTPClient()
+	resp, err := client.Do(req)
 	if err != nil {
 		return false, fmt.Errorf("fetching index: %w", err)
 	}
@@ -491,6 +503,12 @@ func (v *Vendor) getCraneOptions() []crane.Option {
 		opts = append(opts, crane.WithAuthFromKeychain(authn.DefaultKeychain))
 	}
 
+	// Add proxy transport for source operations only
+	if v.config.SourceProxy != nil {
+		transport := v.createSourceProxyTransport()
+		opts = append(opts, crane.WithTransport(transport))
+	}
+
 	return opts
 }
 
@@ -510,7 +528,66 @@ func (v *Vendor) getRemoteOptions() []remote.Option {
 		opts = append(opts, remote.WithAuthFromKeychain(authn.DefaultKeychain))
 	}
 
+	// Add proxy transport for source operations only
+	if v.config.SourceProxy != nil {
+		transport := v.createSourceProxyTransport()
+		opts = append(opts, remote.WithTransport(transport))
+	}
+
 	return opts
+}
+
+// createSourceProxyTransport creates an HTTP transport with proxy configuration for source requests
+func (v *Vendor) createSourceProxyTransport() http.RoundTripper {
+	transport := &http.Transport{
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+	}
+
+	if v.config.SourceProxy != nil && v.config.SourceProxy.URL != "" {
+		proxyURL, err := url.Parse(v.config.SourceProxy.URL)
+		if err == nil {
+			// Add proxy authentication if provided
+			if v.config.SourceProxy.Username != "" {
+				proxyURL.User = url.UserPassword(
+					v.config.SourceProxy.Username,
+					v.config.SourceProxy.Password,
+				)
+			}
+			transport.Proxy = http.ProxyURL(proxyURL)
+		}
+	}
+
+	return transport
+}
+
+// shouldUseProxy determines if proxy should be used for a given source URL
+func (v *Vendor) shouldUseProxy(sourceURL string) bool {
+	if v.config.SourceProxy == nil {
+		return false
+	}
+
+	// Check no_proxy list
+	for _, noProxy := range v.config.SourceProxy.NoProxy {
+		if strings.Contains(sourceURL, noProxy) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// getProxiedHTTPClient creates an HTTP client with proxy configuration for Helm operations
+func (v *Vendor) getProxiedHTTPClient() *http.Client {
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
+
+	if v.config.SourceProxy != nil {
+		client.Transport = v.createSourceProxyTransport()
+	}
+
+	return client
 }
 
 // ListTargetImages lists all images in the target registry under the vendor prefix

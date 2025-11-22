@@ -96,9 +96,10 @@ func runSync(cmd *cobra.Command, args []string) error {
 		cfg = overrideConfigWithFlags(cfg)
 	}
 
-	// Filter by groups if specified (unless using --images override)
+	// Determine requested groups for filtering
+	var requestedGroups []string
 	if len(syncFilterGroups) > 0 && len(images) == 0 {
-		cfg = filterConfigByGroups(cfg, syncFilterGroups)
+		requestedGroups = syncFilterGroups
 	}
 
 	// Filter by type if specified (unless using --images override)
@@ -108,7 +109,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 
 	// Check if we have any images left after filtering
 	if len(images) == 0 {
-		groupedImages := cfg.GetAllImages()
+		groupedImages := cfg.GetAllImagesFiltered(requestedGroups)
 		if len(groupedImages) == 0 {
 			if len(syncFilterGroups) > 0 && syncFilterType != "" {
 				fmt.Printf("No images of type '%s' in groups %v to sync\n", syncFilterType, syncFilterGroups)
@@ -116,6 +117,8 @@ func runSync(cmd *cobra.Command, args []string) error {
 				fmt.Printf("No images in groups %v to sync\n", syncFilterGroups)
 			} else if syncFilterType != "" {
 				fmt.Printf("No images of type '%s' to sync\n", syncFilterType)
+			} else {
+				fmt.Printf("No images to sync (all groups may have sync: false)\n")
 			}
 			return nil
 		}
@@ -138,10 +141,10 @@ func runSync(cmd *cobra.Command, args []string) error {
 	}
 
 	// Print configuration summary
-	printSyncSummary(cfg, configPath, opts)
+	printSyncSummary(cfg, configPath, opts, requestedGroups)
 
 	// Perform sync
-	results, err := v.SyncAll(ctx, opts)
+	results, err := v.SyncAllWithGroups(ctx, opts, requestedGroups)
 	if err != nil {
 		return fmt.Errorf("sync failed: %w", err)
 	}
@@ -282,7 +285,7 @@ func filterConfigByGroups(cfg *config.Config, groups []string) *config.Config {
 	return &newCfg
 }
 
-func printSyncSummary(cfg *config.Config, configPath string, opts vendor.SyncOptions) {
+func printSyncSummary(cfg *config.Config, configPath string, opts vendor.SyncOptions, requestedGroups []string) {
 	fmt.Printf("VendOCI Sync Summary\n")
 	fmt.Printf("===================\n")
 	fmt.Printf("Configuration: %s\n", configPath)
@@ -291,8 +294,13 @@ func printSyncSummary(cfg *config.Config, configPath string, opts vendor.SyncOpt
 	fmt.Printf("Dry Run: %t\n", opts.DryRun)
 	fmt.Printf("Force: %t\n", opts.Force)
 
-	// Count all images from all sources
-	allImages := cfg.GetAllImages()
+	// Show requested groups if any
+	if len(requestedGroups) > 0 {
+		fmt.Printf("Requested Groups: %s\n", strings.Join(requestedGroups, ", "))
+	}
+
+	// Count all images from all sources (with group filtering)
+	allImages := cfg.GetAllImagesFiltered(requestedGroups)
 	fmt.Printf("Images to sync: %d\n", len(allImages))
 	fmt.Println()
 

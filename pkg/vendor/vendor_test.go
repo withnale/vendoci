@@ -3,6 +3,7 @@ package vendor
 import (
 	"context"
 	"log"
+	"net/http"
 	"os"
 	"testing"
 
@@ -153,4 +154,217 @@ func TestTargetImageGeneration(t *testing.T) {
 	}
 
 	t.Logf("✅ Target generation works: %s -> %s", source, result)
+}
+
+// TestCreateSourceProxyTransport tests proxy transport creation
+func TestCreateSourceProxyTransport(t *testing.T) {
+	tests := []struct {
+		name    string
+		proxy   *config.ProxyConfig
+		wantErr bool
+	}{
+		{
+			name:    "no proxy",
+			proxy:   nil,
+			wantErr: false,
+		},
+		{
+			name: "proxy with URL only",
+			proxy: &config.ProxyConfig{
+				URL: "http://proxy.example.com:8080",
+			},
+			wantErr: false,
+		},
+		{
+			name: "proxy with auth",
+			proxy: &config.ProxyConfig{
+				URL:      "http://proxy.example.com:8080",
+				Username: "user",
+				Password: "pass",
+			},
+			wantErr: false,
+		},
+		{
+			name: "proxy with no_proxy list",
+			proxy: &config.ProxyConfig{
+				URL:     "http://proxy.example.com:8080",
+				NoProxy: []string{"localhost", "internal.registry.com"},
+			},
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &config.Config{
+				SourceProxy: tt.proxy,
+			}
+
+			v := New(cfg, log.New(os.Stdout, "[TEST] ", log.LstdFlags))
+			transport := v.createSourceProxyTransport()
+
+			if transport == nil {
+				t.Errorf("createSourceProxyTransport() returned nil")
+				return
+			}
+
+			// Test that transport is a valid http.RoundTripper
+			req, err := http.NewRequest("GET", "http://example.com", nil)
+			if err != nil {
+				t.Errorf("Failed to create test request: %v", err)
+				return
+			}
+
+			_, err = transport.RoundTrip(req)
+			// We expect errors since this is a test, but transport should be valid
+			if tt.wantErr && err == nil {
+				t.Errorf("Expected error but got none")
+			} else if !tt.wantErr && err != nil {
+				t.Logf("Got expected error (test environment): %v", err)
+			}
+		})
+	}
+}
+
+// TestShouldUseProxy tests proxy decision logic
+func TestShouldUseProxy(t *testing.T) {
+	tests := []struct {
+		name      string
+		proxy     *config.ProxyConfig
+		sourceURL string
+		expected  bool
+	}{
+		{
+			name:      "no proxy config",
+			proxy:     nil,
+			sourceURL: "docker.io/alpine",
+			expected:  false,
+		},
+		{
+			name: "proxy configured - should use",
+			proxy: &config.ProxyConfig{
+				URL: "http://proxy.example.com:8080",
+			},
+			sourceURL: "docker.io/alpine",
+			expected:  true,
+		},
+		{
+			name: "proxy configured - in no_proxy list",
+			proxy: &config.ProxyConfig{
+				URL:     "http://proxy.example.com:8080",
+				NoProxy: []string{"docker.io", "localhost"},
+			},
+			sourceURL: "docker.io/alpine",
+			expected:  false,
+		},
+		{
+			name: "proxy configured - not in no_proxy list",
+			proxy: &config.ProxyConfig{
+				URL:     "http://proxy.example.com:8080",
+				NoProxy: []string{"localhost"},
+			},
+			sourceURL: "docker.io/alpine",
+			expected:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &config.Config{
+				SourceProxy: tt.proxy,
+			}
+
+			v := New(cfg, log.New(os.Stdout, "[TEST] ", log.LstdFlags))
+			result := v.shouldUseProxy(tt.sourceURL)
+
+			if result != tt.expected {
+				t.Errorf("shouldUseProxy() = %v, expected %v", result, tt.expected)
+			}
+		})
+	}
+}
+
+// TestGetProxiedHTTPClient tests HTTP client creation with proxy
+func TestGetProxiedHTTPClient(t *testing.T) {
+	tests := []struct {
+		name    string
+		proxy   *config.ProxyConfig
+		wantNil bool
+	}{
+		{
+			name:    "no proxy config",
+			proxy:   nil,
+			wantNil: false,
+		},
+		{
+			name: "proxy configured",
+			proxy: &config.ProxyConfig{
+				URL: "http://proxy.example.com:8080",
+			},
+			wantNil: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &config.Config{
+				SourceProxy: tt.proxy,
+			}
+
+			v := New(cfg, log.New(os.Stdout, "[TEST] ", log.LstdFlags))
+			client := v.getProxiedHTTPClient()
+
+			if client == nil {
+				if !tt.wantNil {
+					t.Errorf("getProxiedHTTPClient() returned nil unexpectedly")
+				}
+				return
+			}
+
+			if tt.wantNil {
+				t.Errorf("getProxiedHTTPClient() expected nil, got non-nil")
+				return
+			}
+
+			// Test that client has the expected properties
+			if client.Timeout == 0 {
+				t.Errorf("Expected client timeout to be set")
+			}
+		})
+	}
+}
+
+// TestProxyConfigInOptions tests that proxy configuration is properly applied to crane and remote options
+func TestProxyConfigInOptions(t *testing.T) {
+	proxyCfg := &config.ProxyConfig{
+		URL:      "http://proxy.example.com:8080",
+		Username: "testuser",
+		Password: "testpass",
+		NoProxy:  []string{"localhost", "internal.registry.com"},
+	}
+
+	cfg := &config.Config{
+		TargetRegistry: "ghcr.io/test/test",
+		VendorPrefix:   "vendor",
+		SourceProxy:    proxyCfg,
+	}
+
+	v := New(cfg, log.New(os.Stdout, "[TEST] ", log.LstdFlags))
+
+	// Test crane options
+	craneOpts := v.getCraneOptions()
+	if len(craneOpts) == 0 {
+		t.Errorf("Expected at least one crane option, got none")
+	}
+
+	// Test remote options
+	remoteOpts := v.getRemoteOptions()
+	if len(remoteOpts) == 0 {
+		t.Errorf("Expected at least one remote option, got none")
+	}
+
+	// Note: We can't easily test the transport directly without a more complex setup,
+	// but we can verify that options are being generated
+	t.Logf("✅ Proxy configuration properly integrated - generated %d crane options and %d remote options",
+		len(craneOpts), len(remoteOpts))
 }

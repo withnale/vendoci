@@ -32,12 +32,22 @@ type Config struct {
 
 	// Registry authentication
 	Auth AuthConfig `yaml:"auth" json:"auth"`
+
+	// Proxy configuration for source requests only
+	SourceProxy *ProxyConfig `yaml:"source_proxy,omitempty" json:"source_proxy,omitempty"`
 }
 
 // GroupConfig represents a group of images and charts
 type GroupConfig struct {
+	// Images to vendor
 	Images []ImageConfig `yaml:"images,omitempty" json:"images,omitempty"`
-	Charts []ChartEntry  `yaml:"charts,omitempty" json:"charts,omitempty"`
+
+	// Charts to vendor
+	Charts []ChartEntry `yaml:"charts,omitempty" json:"charts,omitempty"`
+
+	// Sync controls whether this group is automatically synced (default: true)
+	// When false, the group is only synced when explicitly specified via --groups flag
+	Sync *bool `yaml:"sync,omitempty" json:"sync,omitempty"`
 }
 
 // ChartEntry represents a chart within a group
@@ -95,6 +105,21 @@ type AuthConfig struct {
 
 	// Environment variable name for token
 	TokenEnv string `yaml:"token_env,omitempty" json:"token_env,omitempty"`
+}
+
+// ProxyConfig represents HTTP/HTTPS proxy configuration for source requests
+type ProxyConfig struct {
+	// Proxy URL for source requests (e.g., "http://proxy.company.com:8080")
+	URL string `yaml:"url" json:"url"`
+
+	// No proxy for these source registries
+	NoProxy []string `yaml:"no_proxy,omitempty" json:"no_proxy,omitempty"`
+
+	// Proxy authentication (optional)
+	Username string `yaml:"username,omitempty" json:"username,omitempty"`
+
+	// Password for proxy authentication
+	Password string `yaml:"password,omitempty" json:"password,omitempty"`
 }
 
 // LoadConfig loads configuration from a YAML file or directory
@@ -269,6 +294,13 @@ func mergeTwoConfigs(base, overlay *Config) *Config {
 	// Merge auth - overlay wins for any set field
 	merged.Auth = mergeAuth(base.Auth, overlay.Auth)
 
+	// Merge proxy - overlay wins if set
+	if overlay.SourceProxy != nil {
+		merged.SourceProxy = overlay.SourceProxy
+	} else {
+		merged.SourceProxy = base.SourceProxy
+	}
+
 	// Merge groups - deep merge by group name
 	merged.Groups = mergeGroups(base.Groups, overlay.Groups)
 
@@ -335,6 +367,12 @@ func mergeGroups(base, overlay map[string]GroupConfig) map[string]GroupConfig {
 				Images: append(append([]ImageConfig{}, baseGroup.Images...), overlayGroup.Images...),
 				Charts: append(append([]ChartEntry{}, baseGroup.Charts...), overlayGroup.Charts...),
 			}
+			// Overlay's sync flag takes precedence if set
+			if overlayGroup.Sync != nil {
+				mergedGroup.Sync = overlayGroup.Sync
+			} else {
+				mergedGroup.Sync = baseGroup.Sync
+			}
 			merged[name] = mergedGroup
 		} else {
 			// Add new group
@@ -364,11 +402,42 @@ func postProcessConfig(config *Config) (*Config, error) {
 }
 
 // GetAllImages returns all images and charts with their group names
+// Only includes groups where sync is true (or not specified) unless groups are explicitly requested
 func (c *Config) GetAllImages() []GroupedImage {
+	return c.GetAllImagesFiltered(nil)
+}
+
+// GetAllImagesFiltered returns all images and charts with their group names
+// If requestedGroups is nil or empty, only returns groups where sync is true (or not specified)
+// If requestedGroups is provided, returns only those groups regardless of sync flag
+func (c *Config) GetAllImagesFiltered(requestedGroups []string) []GroupedImage {
 	var result []GroupedImage
+
+	// Create a map for O(1) lookups if groups are specified
+	var groupMap map[string]bool
+	if len(requestedGroups) > 0 {
+		groupMap = make(map[string]bool)
+		for _, group := range requestedGroups {
+			groupMap[group] = true
+		}
+	}
 
 	// Add images and charts from groups
 	for groupName, group := range c.Groups {
+		// Determine if this group should be included
+		shouldInclude := false
+		if len(requestedGroups) > 0 {
+			// If groups are explicitly requested, include only those groups
+			shouldInclude = groupMap[groupName]
+		} else {
+			// If no groups specified, include only if sync is true or not set (default true)
+			shouldInclude = c.ShouldSyncGroup(groupName)
+		}
+
+		if !shouldInclude {
+			continue
+		}
+
 		// Add images
 		for _, img := range group.Images {
 			normalizedImg := normalizeImageConfig(img)
@@ -421,6 +490,22 @@ func (c *Config) GetAllImages() []GroupedImage {
 	}
 
 	return result
+}
+
+// ShouldSyncGroup returns whether a group should be automatically synced
+// Returns true if sync is not set (default) or explicitly set to true
+func (c *Config) ShouldSyncGroup(groupName string) bool {
+	group, exists := c.Groups[groupName]
+	if !exists {
+		return false
+	}
+
+	// If Sync is nil (not specified), default to true
+	if group.Sync == nil {
+		return true
+	}
+
+	return *group.Sync
 }
 
 // GetImageBasename extracts the basename from an image source path
