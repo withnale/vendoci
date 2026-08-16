@@ -89,8 +89,8 @@ func runList(cmd *cobra.Command, args []string) error {
 
 	// Display configuration info
 	fmt.Printf("Configuration: %s\n", cfgFile)
-	fmt.Printf("Target Registry: %s\n", cfg.TargetRegistry)
-	fmt.Printf("Vendor Prefix: %s\n\n", cfg.VendorPrefix)
+	fmt.Printf("Target Registry: %s\n", cfg.Target.Registry)
+	fmt.Printf("Vendor Prefix: %s\n\n", cfg.Target.Prefix)
 
 	// Create table
 	var table *TablePrinter
@@ -210,12 +210,12 @@ func loadConfigForList() (*config.Config, error) {
 func generateTarget(cfg *config.Config, img config.ImageConfig, imgType string, chartName string) string {
 	// For Helm charts, use vendor/charts/{chartName} format
 	if imgType == "helm" {
-		return fmt.Sprintf("%s/%s/charts/%s", cfg.TargetRegistry, cfg.VendorPrefix, chartName)
+		return fmt.Sprintf("%s/%s/charts/%s", cfg.Target.Registry, cfg.Target.Prefix, chartName)
 	}
 
 	// For OCI images, use existing logic
 	if img.TargetOverride != "" {
-		return fmt.Sprintf("%s/%s/%s", cfg.TargetRegistry, cfg.VendorPrefix, img.TargetOverride)
+		return fmt.Sprintf("%s/%s/%s", cfg.Target.Registry, cfg.Target.Prefix, img.TargetOverride)
 	}
 	return cfg.GenerateTargetImage(img.Source)
 }

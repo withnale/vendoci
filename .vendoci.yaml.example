@@ -1,19 +1,20 @@
 # VendOCI Configuration Example
 # Copy this file to .vendoci.yaml and customize for your environment
 
-# Target registry where images will be vendored
-target_registry: "myregistry.example.com"
+target:
+  # Target registry where images will be vendored
+  registry: "myregistry.example.com"
 
-# Prefix for vendored images (default: "vendor")
-vendor_prefix: "vendor"
+  # Prefix for vendored images (default: "vendor")
+  prefix: "vendor"
 
-# Authentication for the target registry
-auth:
-  username: "your-username"
-  # Instead of hardcoding password, use environment variable
-  password_env: "VENDOCI_PASSWORD"
-  # Alternative: use token authentication
-  # token_env: "VENDOCI_TOKEN"
+  # Authentication for the target registry
+  auth:
+    username: "your-username"
+    # Instead of hardcoding password, use environment variable
+    password_env: "VENDOCI_PASSWORD"
+    # Alternative: use token authentication
+    # token_env: "VENDOCI_TOKEN"
 
 # Images organized by groups (recommended)
 groups:

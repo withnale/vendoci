@@ -19,6 +19,7 @@ var (
 	checkFilterType   string
 	errorsOnly        bool
 	checkFilterGroups []string
+	checkLong         bool
 )
 
 // checkCmd represents the check command
@@ -57,6 +58,10 @@ Examples:
   vendoci check --groups alpine
   vendoci check -G alpine -G busybox
 
+  # Show the full target path (registry and prefix included)
+  vendoci check --long
+  vendoci check -l
+
   # Combine filters
   vendoci check --type oci --groups alpine --errors`,
 	RunE: runCheck,
@@ -70,6 +75,7 @@ func init() {
 	checkCmd.Flags().StringVar(&checkFilterType, "type", "", "Filter by type: oci or helm (default: show all)")
 	checkCmd.Flags().BoolVarP(&errorsOnly, "errors", "E", false, "Show only images with errors (missing from source or dest)")
 	checkCmd.Flags().StringSliceVarP(&checkFilterGroups, "groups", "G", []string{}, "Filter by group names (can specify multiple times)")
+	checkCmd.Flags().BoolVarP(&checkLong, "long", "l", false, "Show the full target path, including the target registry and prefix")
 }
 
 // ImageCheckResult represents the result of checking an image
@@ -125,8 +131,8 @@ func runCheck(cmd *cobra.Command, args []string) error {
 
 	// Display configuration info
 	fmt.Printf("Configuration: %s\n", cfgFile)
-	fmt.Printf("Target Registry: %s\n", cfg.TargetRegistry)
-	fmt.Printf("Vendor Prefix: %s\n", cfg.VendorPrefix)
+	fmt.Printf("Target Registry: %s\n", cfg.Target.Registry)
+	fmt.Printf("Vendor Prefix: %s\n", cfg.Target.Prefix)
 	fmt.Printf("Parallel Checks: %d\n\n", parallel)
 
 	// Create logger
@@ -198,7 +204,7 @@ func runCheck(cmd *cobra.Command, args []string) error {
 	}
 
 	// Display results
-	displayCheckResults(results, errorsOnly)
+	displayCheckResults(cfg, results, errorsOnly)
 
 	return nil
 }
@@ -228,17 +234,17 @@ func performChecks(ctx context.Context, v *vendor.Vendor, checks []ImageCheckRes
 				results[idx].SourceError = sourceErr
 
 				// Target check for helm charts (still uses OCI check as charts are stored as OCI artifacts)
-				targetExists, targetErr := checkImageExists(ctx, v, results[idx].TargetImage)
+				targetExists, targetErr := checkTargetImageExists(ctx, v, results[idx].TargetImage)
 				results[idx].TargetExists = targetExists
 				results[idx].TargetError = targetErr
 			} else {
-				// For OCI images, use CheckImageExists
-				sourceExists, sourceErr := checkImageExists(ctx, v, results[idx].SourceImage)
+				// For OCI images, use CheckSourceImageExists (source proxy/TLS/auth settings)
+				sourceExists, sourceErr := checkSourceImageExists(ctx, v, results[idx].SourceImage)
 				results[idx].SourceExists = sourceExists
 				results[idx].SourceError = sourceErr
 
-				// Check target image
-				targetExists, targetErr := checkImageExists(ctx, v, results[idx].TargetImage)
+				// Check target image (target proxy/TLS/auth settings)
+				targetExists, targetErr := checkTargetImageExists(ctx, v, results[idx].TargetImage)
 				results[idx].TargetExists = targetExists
 				results[idx].TargetError = targetErr
 			}
@@ -249,7 +255,11 @@ func performChecks(ctx context.Context, v *vendor.Vendor, checks []ImageCheckRes
 	return results
 }
 
-func checkImageExists(ctx context.Context, v *vendor.Vendor, imageRef string) (bool, error) {
+func checkSourceImageExists(ctx context.Context, v *vendor.Vendor, imageRef string) (bool, error) {
+	return v.CheckSourceImageExists(ctx, imageRef)
+}
+
+func checkTargetImageExists(ctx context.Context, v *vendor.Vendor, imageRef string) (bool, error) {
 	return v.CheckImageExists(ctx, imageRef)
 }
 
@@ -283,7 +293,7 @@ func filterErrorResults(results []ImageCheckResult) []ImageCheckResult {
 	return filtered
 }
 
-func displayCheckResults(results []ImageCheckResult, showingErrorsOnly bool) {
+func displayCheckResults(cfg *config.Config, results []ImageCheckResult, showingErrorsOnly bool) {
 	table := NewTable("GROUP", "NAME", "SOURCE_PATH", "VERSION", "TYPE", "SOURCE", "DEST", "TARGET_PATH")
 
 	presentCount := 0
@@ -295,6 +305,11 @@ func displayCheckResults(results []ImageCheckResult, showingErrorsOnly bool) {
 		sourceStatus := formatStatus(result.SourceExists, result.SourceError)
 		targetStatus := formatStatus(result.TargetExists, result.TargetError)
 
+		targetPath := result.TargetImage
+		if !checkLong {
+			targetPath = shortTargetPath(cfg, targetPath)
+		}
+
 		table.AddRow(
 			result.GroupName,
 			result.Name,
@@ -303,7 +318,7 @@ func displayCheckResults(results []ImageCheckResult, showingErrorsOnly bool) {
 			result.Type,
 			sourceStatus,
 			targetStatus,
-			result.TargetImage,
+			targetPath,
 		)
 
 		// Count statuses
@@ -349,6 +364,17 @@ func displayCheckResults(results []ImageCheckResult, showingErrorsOnly bool) {
 			}
 		}
 	}
+}
+
+// shortTargetPath strips the target registry and prefix from a full target
+// image reference, leaving just the path (and tag) underneath them.
+// e.g. "registry.company.com/vendor/docker.io/ubuntu:22.04" -> "docker.io/ubuntu:22.04"
+func shortTargetPath(cfg *config.Config, targetImage string) string {
+	prefix := fmt.Sprintf("%s/%s/", cfg.Target.Registry, cfg.Target.Prefix)
+	if strings.HasPrefix(targetImage, prefix) {
+		return strings.TrimPrefix(targetImage, prefix)
+	}
+	return targetImage
 }
 
 func formatStatus(exists bool, err error) string {

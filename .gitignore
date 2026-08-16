@@ -1,0 +1,38 @@
+# Build artifacts
+vendoci
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test artifacts
+*.test
+*.out
+coverage.html
+coverage.out
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Environment
+.env
+.env.*
+
+# Docker volumes (local testing)
+docker/nexus-data/
+
+# Logs
+*.log

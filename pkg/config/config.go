@@ -11,11 +11,11 @@ import (
 
 // Config represents the main configuration structure
 type Config struct {
-	// Target registry where images will be vendored
-	TargetRegistry string `yaml:"target_registry" json:"target_registry"`
+	// Source registry/repository configuration
+	Source SourceConfig `yaml:"source,omitempty" json:"source,omitempty"`
 
-	// Prefix for vendored images (e.g., "vendor")
-	VendorPrefix string `yaml:"vendor_prefix" json:"vendor_prefix"`
+	// Target registry configuration
+	Target TargetConfig `yaml:"target" json:"target"`
 
 	// Images to vendor (can be array or map format)
 	// The actual type is determined during unmarshaling
@@ -29,12 +29,43 @@ type Config struct {
 
 	// Groups of images and charts to vendor
 	Groups map[string]GroupConfig `yaml:"groups,omitempty" json:"groups,omitempty"`
+}
+
+// SourceConfig represents configuration that applies to source registries/repositories
+type SourceConfig struct {
+	// Authentication for source registries. Most sources (docker.io, gcr.io, ghcr.io
+	// public images, etc.) are anonymous - leave this unset and pulls fall back to
+	// the local Docker credential store/keychain. Only set this if the source
+	// registry itself requires credentials.
+	Auth AuthConfig `yaml:"auth,omitempty" json:"auth,omitempty"`
+
+	// Proxy configuration for source requests only
+	Proxy *ProxyConfig `yaml:"proxy,omitempty" json:"proxy,omitempty"`
+
+	// TLSVerify controls TLS certificate verification for source registry/Helm-repo
+	// connections. Defaults to true (verify) when unset; set to false to skip
+	// verification (e.g. for a source behind a self-signed certificate).
+	TLSVerify *bool `yaml:"tls_verify,omitempty" json:"tls_verify,omitempty"`
+}
+
+// TargetConfig represents configuration for the target (destination) registry
+type TargetConfig struct {
+	// Target registry where images will be vendored
+	Registry string `yaml:"registry" json:"registry"`
+
+	// Prefix for vendored images (e.g., "vendor")
+	Prefix string `yaml:"prefix" json:"prefix"`
 
 	// Registry authentication
 	Auth AuthConfig `yaml:"auth" json:"auth"`
 
-	// Proxy configuration for source requests only
-	SourceProxy *ProxyConfig `yaml:"source_proxy,omitempty" json:"source_proxy,omitempty"`
+	// Proxy configuration for destination (target registry) requests only
+	Proxy *ProxyConfig `yaml:"proxy,omitempty" json:"proxy,omitempty"`
+
+	// TLSVerify controls TLS certificate verification for target registry
+	// connections. Defaults to true (verify) when unset; set to false to skip
+	// verification (e.g. for a target behind a self-signed certificate).
+	TLSVerify *bool `yaml:"tls_verify,omitempty" json:"tls_verify,omitempty"`
 }
 
 // GroupConfig represents a group of images and charts
@@ -107,12 +138,12 @@ type AuthConfig struct {
 	TokenEnv string `yaml:"token_env,omitempty" json:"token_env,omitempty"`
 }
 
-// ProxyConfig represents HTTP/HTTPS proxy configuration for source requests
+// ProxyConfig represents HTTP/HTTPS proxy configuration for source or destination requests
 type ProxyConfig struct {
-	// Proxy URL for source requests (e.g., "http://proxy.company.com:8080")
+	// Proxy URL (e.g., "http://proxy.company.com:8080")
 	URL string `yaml:"url" json:"url"`
 
-	// No proxy for these source registries
+	// No proxy for these registries
 	NoProxy []string `yaml:"no_proxy,omitempty" json:"no_proxy,omitempty"`
 
 	// Proxy authentication (optional)
@@ -120,6 +151,11 @@ type ProxyConfig struct {
 
 	// Password for proxy authentication
 	Password string `yaml:"password,omitempty" json:"password,omitempty"`
+
+	// TLSVerify controls TLS certificate verification for the connection to
+	// this proxy itself (only relevant when url uses https). Defaults to true
+	// (verify) when unset; set to false to skip verification.
+	TLSVerify *bool `yaml:"tls_verify,omitempty" json:"tls_verify,omitempty"`
 }
 
 // LoadConfig loads configuration from a YAML file or directory
@@ -278,28 +314,9 @@ func mergeConfigs(configs []*Config) *Config {
 func mergeTwoConfigs(base, overlay *Config) *Config {
 	merged := &Config{}
 
-	// Merge simple fields - overlay wins if set
-	if overlay.TargetRegistry != "" {
-		merged.TargetRegistry = overlay.TargetRegistry
-	} else {
-		merged.TargetRegistry = base.TargetRegistry
-	}
-
-	if overlay.VendorPrefix != "" {
-		merged.VendorPrefix = overlay.VendorPrefix
-	} else {
-		merged.VendorPrefix = base.VendorPrefix
-	}
-
-	// Merge auth - overlay wins for any set field
-	merged.Auth = mergeAuth(base.Auth, overlay.Auth)
-
-	// Merge proxy - overlay wins if set
-	if overlay.SourceProxy != nil {
-		merged.SourceProxy = overlay.SourceProxy
-	} else {
-		merged.SourceProxy = base.SourceProxy
-	}
+	// Merge source and target sections - overlay wins per-field
+	merged.Source = mergeSource(base.Source, overlay.Source)
+	merged.Target = mergeTarget(base.Target, overlay.Target)
 
 	// Merge groups - deep merge by group name
 	merged.Groups = mergeGroups(base.Groups, overlay.Groups)
@@ -322,6 +339,60 @@ func mergeTwoConfigs(base, overlay *Config) *Config {
 		merged.Images = overlay.Images
 	} else {
 		merged.Images = base.Images
+	}
+
+	return merged
+}
+
+// mergeSource merges two source configs, with 'overlay' taking precedence
+func mergeSource(base, overlay SourceConfig) SourceConfig {
+	merged := SourceConfig{}
+
+	merged.Auth = mergeAuth(base.Auth, overlay.Auth)
+
+	if overlay.Proxy != nil {
+		merged.Proxy = overlay.Proxy
+	} else {
+		merged.Proxy = base.Proxy
+	}
+
+	if overlay.TLSVerify != nil {
+		merged.TLSVerify = overlay.TLSVerify
+	} else {
+		merged.TLSVerify = base.TLSVerify
+	}
+
+	return merged
+}
+
+// mergeTarget merges two target configs, with 'overlay' taking precedence
+func mergeTarget(base, overlay TargetConfig) TargetConfig {
+	merged := TargetConfig{}
+
+	if overlay.Registry != "" {
+		merged.Registry = overlay.Registry
+	} else {
+		merged.Registry = base.Registry
+	}
+
+	if overlay.Prefix != "" {
+		merged.Prefix = overlay.Prefix
+	} else {
+		merged.Prefix = base.Prefix
+	}
+
+	merged.Auth = mergeAuth(base.Auth, overlay.Auth)
+
+	if overlay.Proxy != nil {
+		merged.Proxy = overlay.Proxy
+	} else {
+		merged.Proxy = base.Proxy
+	}
+
+	if overlay.TLSVerify != nil {
+		merged.TLSVerify = overlay.TLSVerify
+	} else {
+		merged.TLSVerify = base.TLSVerify
 	}
 
 	return merged
@@ -386,16 +457,22 @@ func mergeGroups(base, overlay map[string]GroupConfig) map[string]GroupConfig {
 // postProcessConfig applies environment variable substitutions and defaults
 func postProcessConfig(config *Config) (*Config, error) {
 	// Apply environment variable substitutions
-	if config.Auth.PasswordEnv != "" && config.Auth.Password == "" {
-		config.Auth.Password = os.Getenv(config.Auth.PasswordEnv)
+	if config.Source.Auth.PasswordEnv != "" && config.Source.Auth.Password == "" {
+		config.Source.Auth.Password = os.Getenv(config.Source.Auth.PasswordEnv)
 	}
-	if config.Auth.TokenEnv != "" && config.Auth.Token == "" {
-		config.Auth.Token = os.Getenv(config.Auth.TokenEnv)
+	if config.Source.Auth.TokenEnv != "" && config.Source.Auth.Token == "" {
+		config.Source.Auth.Token = os.Getenv(config.Source.Auth.TokenEnv)
+	}
+	if config.Target.Auth.PasswordEnv != "" && config.Target.Auth.Password == "" {
+		config.Target.Auth.Password = os.Getenv(config.Target.Auth.PasswordEnv)
+	}
+	if config.Target.Auth.TokenEnv != "" && config.Target.Auth.Token == "" {
+		config.Target.Auth.Token = os.Getenv(config.Target.Auth.TokenEnv)
 	}
 
 	// Set defaults
-	if config.VendorPrefix == "" {
-		config.VendorPrefix = "vendor"
+	if config.Target.Prefix == "" {
+		config.Target.Prefix = "vendor"
 	}
 
 	return config, nil
@@ -538,7 +615,7 @@ func (c *Config) GenerateTargetImage(source string) string {
 	// Keep the original path structure
 	transformed := transformSourceName(source)
 
-	return fmt.Sprintf("%s/%s/%s", c.TargetRegistry, c.VendorPrefix, transformed)
+	return fmt.Sprintf("%s/%s/%s", c.Target.Registry, c.Target.Prefix, transformed)
 }
 
 // transformSourceName converts a source image name to a vendor-friendly format

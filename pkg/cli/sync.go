@@ -22,6 +22,7 @@ var (
 	tags             []string
 	syncFilterType   string
 	syncFilterGroups []string
+	syncParallel     int
 )
 
 // syncCmd represents the sync command
@@ -56,6 +57,10 @@ Examples:
   vendoci sync --groups alpine
   vendoci sync -G alpine -G busybox
 
+  # Sync with parallel workers for faster results
+  vendoci sync --parallel 10
+  vendoci sync -p 10
+
   # Combine filters
   vendoci sync --type oci --groups alpine --dry-run`,
 	RunE: runSync,
@@ -71,6 +76,7 @@ func init() {
 	syncCmd.Flags().StringSliceVar(&tags, "tags", []string{}, "Comma-separated list of specific tags to sync (requires --images)")
 	syncCmd.Flags().StringVar(&syncFilterType, "type", "", "Filter by type: oci or helm (default: sync all)")
 	syncCmd.Flags().StringSliceVarP(&syncFilterGroups, "groups", "G", []string{}, "Filter by group names (can specify multiple times)")
+	syncCmd.Flags().IntVarP(&syncParallel, "parallel", "p", 5, "Number of parallel syncs to perform")
 
 	// Bind flags to viper
 	viper.BindPFlag("sync.dry-run", syncCmd.Flags().Lookup("dry-run"))
@@ -135,9 +141,10 @@ func runSync(cmd *cobra.Command, args []string) error {
 
 	// Setup sync options
 	opts := vendor.SyncOptions{
-		DryRun:  dryRun,
-		Verbose: viper.GetBool("verbose"),
-		Force:   force,
+		DryRun:   dryRun,
+		Verbose:  viper.GetBool("verbose"),
+		Force:    force,
+		Parallel: syncParallel,
 	}
 
 	// Print configuration summary
@@ -192,8 +199,8 @@ func loadConfigForSync() (*config.Config, string, error) {
 }
 
 func validateConfig(cfg *config.Config) error {
-	if cfg.TargetRegistry == "" {
-		return fmt.Errorf("target_registry must be specified")
+	if cfg.Target.Registry == "" {
+		return fmt.Errorf("target.registry must be specified")
 	}
 
 	// Check if there are any images configured
@@ -289,10 +296,11 @@ func printSyncSummary(cfg *config.Config, configPath string, opts vendor.SyncOpt
 	fmt.Printf("VendOCI Sync Summary\n")
 	fmt.Printf("===================\n")
 	fmt.Printf("Configuration: %s\n", configPath)
-	fmt.Printf("Target Registry: %s\n", cfg.TargetRegistry)
-	fmt.Printf("Vendor Prefix: %s\n", cfg.VendorPrefix)
+	fmt.Printf("Target Registry: %s\n", cfg.Target.Registry)
+	fmt.Printf("Vendor Prefix: %s\n", cfg.Target.Prefix)
 	fmt.Printf("Dry Run: %t\n", opts.DryRun)
 	fmt.Printf("Force: %t\n", opts.Force)
+	fmt.Printf("Parallel Syncs: %d\n", opts.Parallel)
 
 	// Show requested groups if any
 	if len(requestedGroups) > 0 {

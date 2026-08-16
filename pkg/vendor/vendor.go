@@ -2,18 +2,22 @@ package vendor
 
 import (
 	"context"
+	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/crane"
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 	"github.com/rhodesp/vendoci/pkg/config"
 	"gopkg.in/yaml.v3"
 	"helm.sh/helm/v3/pkg/registry"
@@ -35,9 +39,10 @@ func New(cfg *config.Config, logger *log.Logger) *Vendor {
 
 // SyncOptions contains options for the sync operation
 type SyncOptions struct {
-	DryRun  bool
-	Verbose bool
-	Force   bool // Force re-sync even if image exists
+	DryRun   bool
+	Verbose  bool
+	Force    bool // Force re-sync even if image exists
+	Parallel int  // Number of syncs to run concurrently (defaults to 1 if < 1)
 }
 
 // SyncResult represents the result of a sync operation
@@ -83,31 +88,66 @@ func (v *Vendor) SyncAll(ctx context.Context, opts SyncOptions) ([]SyncResult, e
 	return v.SyncAllWithGroups(ctx, opts, nil)
 }
 
-// SyncAllWithGroups syncs images and charts with optional group filtering
-func (v *Vendor) SyncAllWithGroups(ctx context.Context, opts SyncOptions, requestedGroups []string) ([]SyncResult, error) {
-	var results []SyncResult
+// syncUnit represents a single image:tag or chart:version to sync
+type syncUnit struct {
+	isHelm      bool
+	chartName   string
+	imageConfig config.ImageConfig
+	tag         string
+}
 
+// SyncAllWithGroups syncs images and charts with optional group filtering.
+// Sync units are processed concurrently, bounded by opts.Parallel (default 1).
+func (v *Vendor) SyncAllWithGroups(ctx context.Context, opts SyncOptions, requestedGroups []string) ([]SyncResult, error) {
 	// Get all images with their groups, respecting sync flags and group filters
 	groupedImages := v.config.GetAllImagesFiltered(requestedGroups)
 
+	var units []syncUnit
 	for _, groupedImg := range groupedImages {
-		var imageResults []SyncResult
-		var err error
-
-		// Handle based on type
-		if groupedImg.Type == "helm" {
-			// Sync Helm chart
-			imageResults, err = v.SyncHelmChart(ctx, groupedImg, opts)
-		} else {
-			// Sync OCI image
-			imageResults, err = v.SyncImage(ctx, groupedImg.Image, opts)
+		for _, tag := range groupedImg.Image.Tags {
+			units = append(units, syncUnit{
+				isHelm:      groupedImg.Type == "helm",
+				chartName:   groupedImg.ChartName,
+				imageConfig: groupedImg.Image,
+				tag:         tag,
+			})
 		}
-
-		if err != nil {
-			return results, fmt.Errorf("syncing %s %s: %w", groupedImg.Type, groupedImg.Image.Source, err)
-		}
-		results = append(results, imageResults...)
 	}
+
+	results := make([]SyncResult, len(units))
+
+	parallelism := opts.Parallel
+	if parallelism < 1 {
+		parallelism = 1
+	}
+
+	// Semaphore to bound concurrency
+	sem := make(chan struct{}, parallelism)
+	var wg sync.WaitGroup
+
+	for i, unit := range units {
+		wg.Add(1)
+		go func(idx int, u syncUnit) {
+			defer wg.Done()
+
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			if u.isHelm {
+				results[idx] = v.syncSingleHelmChart(ctx, u.imageConfig.Source, u.chartName, u.tag, opts)
+				if results[idx].Status == SyncStatusFailed && opts.Verbose {
+					v.logger.Printf("Failed to sync chart %s:%s: %v", u.chartName, u.tag, results[idx].Error)
+				}
+			} else {
+				results[idx] = v.syncSingleImage(ctx, u.imageConfig, u.tag, opts)
+				if results[idx].Status == SyncStatusFailed && opts.Verbose {
+					v.logger.Printf("Failed to sync %s:%s: %v", u.imageConfig.Source, u.tag, results[idx].Error)
+				}
+			}
+		}(i, unit)
+	}
+
+	wg.Wait()
 
 	return results, nil
 }
@@ -137,7 +177,7 @@ func (v *Vendor) syncSingleImage(ctx context.Context, imageConfig config.ImageCo
 	// Generate target image name
 	var targetBase string
 	if imageConfig.TargetOverride != "" {
-		targetBase = fmt.Sprintf("%s/%s/%s", v.config.TargetRegistry, v.config.VendorPrefix, imageConfig.TargetOverride)
+		targetBase = fmt.Sprintf("%s/%s/%s", v.config.Target.Registry, v.config.Target.Prefix, imageConfig.TargetOverride)
 	} else {
 		targetBase = v.config.GenerateTargetImage(imageConfig.Source)
 	}
@@ -219,7 +259,7 @@ func (v *Vendor) syncSingleHelmChart(ctx context.Context, repoURL, chartName, ve
 	sourceRef := fmt.Sprintf("%s:%s", repoURL, version)
 
 	// Generate target OCI reference: {registry}/{vendor-prefix}/charts/{chartName}:{version}
-	targetBase := fmt.Sprintf("%s/%s/charts/%s", v.config.TargetRegistry, v.config.VendorPrefix, chartName)
+	targetBase := fmt.Sprintf("%s/%s/charts/%s", v.config.Target.Registry, v.config.Target.Prefix, chartName)
 	targetRef := fmt.Sprintf("%s:%s", targetBase, version)
 
 	result := SyncResult{
@@ -284,7 +324,7 @@ func (v *Vendor) syncHelmChartToOCI(ctx context.Context, repoURL, chartName, ver
 		return fmt.Errorf("creating index request: %w", err)
 	}
 
-	client := v.getProxiedHTTPClient()
+	client := v.getSourceProxiedHTTPClient()
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("fetching index: %w", err)
@@ -337,7 +377,7 @@ func (v *Vendor) syncHelmChartToOCI(ctx context.Context, repoURL, chartName, ver
 		return fmt.Errorf("creating chart download request: %w", err)
 	}
 
-	client = v.getProxiedHTTPClient()
+	client = v.getSourceProxiedHTTPClient()
 	chartResp, err := client.Do(chartReq)
 	if err != nil {
 		return fmt.Errorf("downloading chart: %w", err)
@@ -355,20 +395,18 @@ func (v *Vendor) syncHelmChartToOCI(ctx context.Context, repoURL, chartName, ver
 	}
 
 	// Step 4: Push the chart to OCI registry using Helm's native registry client
-	// Create Helm registry client
-	helmClient, err := registry.NewClient()
-	if err != nil {
-		return fmt.Errorf("creating Helm registry client: %w", err)
+	// Create Helm registry client, routing pushes through the destination proxy/TLS settings if configured
+	var helmClientOpts []registry.ClientOption
+	if v.config.Target.Auth.Username != "" && v.config.Target.Auth.Password != "" {
+		helmClientOpts = append(helmClientOpts, registry.ClientOptBasicAuth(v.config.Target.Auth.Username, v.config.Target.Auth.Password))
+	}
+	if needsCustomTransport(v.config.Target.Proxy, v.config.Target.TLSVerify) {
+		helmClientOpts = append(helmClientOpts, registry.ClientOptHTTPClient(v.getDestinationProxiedHTTPClient()))
 	}
 
-	// Configure authentication if available
-	if v.config.Auth.Username != "" && v.config.Auth.Password != "" {
-		helmClient, err = registry.NewClient(
-			registry.ClientOptBasicAuth(v.config.Auth.Username, v.config.Auth.Password),
-		)
-		if err != nil {
-			return fmt.Errorf("creating Helm registry client with auth: %w", err)
-		}
+	helmClient, err := registry.NewClient(helmClientOpts...)
+	if err != nil {
+		return fmt.Errorf("creating Helm registry client: %w", err)
 	}
 
 	// Push chart to OCI registry using Helm's Push method
@@ -383,9 +421,15 @@ func (v *Vendor) syncHelmChartToOCI(ctx context.Context, repoURL, chartName, ver
 	return nil
 }
 
-// CheckImageExists checks if an image exists in a registry (public method)
+// CheckImageExists checks if an image exists in the target registry (public method)
 func (v *Vendor) CheckImageExists(ctx context.Context, imageRef string) (bool, error) {
 	return v.imageExists(ctx, imageRef)
+}
+
+// CheckSourceImageExists checks if an image exists in a source registry (public method),
+// using source proxy/TLS/auth settings rather than the target's
+func (v *Vendor) CheckSourceImageExists(ctx context.Context, imageRef string) (bool, error) {
+	return v.sourceImageExists(ctx, imageRef)
 }
 
 // HelmRepoIndex represents the structure of a Helm repository index.yaml
@@ -412,7 +456,7 @@ func (v *Vendor) CheckHelmChartExists(ctx context.Context, repoURL, chartName, v
 		return false, fmt.Errorf("creating request: %w", err)
 	}
 
-	client := v.getProxiedHTTPClient()
+	client := v.getSourceProxiedHTTPClient()
 	resp, err := client.Do(req)
 	if err != nil {
 		return false, fmt.Errorf("fetching index: %w", err)
@@ -456,6 +500,17 @@ func (v *Vendor) CheckHelmChartExists(ctx context.Context, repoURL, chartName, v
 
 // imageExists checks if an image exists in the target registry
 func (v *Vendor) imageExists(ctx context.Context, imageRef string) (bool, error) {
+	return imageExistsWithOptions(imageRef, v.getDestRemoteOptions())
+}
+
+// sourceImageExists checks if an image exists in a source registry, using
+// source proxy/TLS/auth settings rather than the target's
+func (v *Vendor) sourceImageExists(ctx context.Context, imageRef string) (bool, error) {
+	return imageExistsWithOptions(imageRef, v.getSourceRemoteOptions())
+}
+
+// imageExistsWithOptions checks if an image exists in a registry using the given remote options
+func imageExistsWithOptions(imageRef string, opts []remote.Option) (bool, error) {
 	// Parse the image reference
 	ref, err := name.ParseReference(imageRef)
 	if err != nil {
@@ -463,10 +518,9 @@ func (v *Vendor) imageExists(ctx context.Context, imageRef string) (bool, error)
 	}
 
 	// Try to get the manifest
-	_, err = remote.Get(ref, v.getRemoteOptions()...)
+	_, err = remote.Get(ref, opts...)
 	if err != nil {
-		// If it's a "not found" error, the image doesn't exist
-		if strings.Contains(err.Error(), "404") || strings.Contains(err.Error(), "not found") {
+		if isNotFound(err) {
 			return false, nil
 		}
 		// Other errors are actual errors
@@ -476,26 +530,65 @@ func (v *Vendor) imageExists(ctx context.Context, imageRef string) (bool, error)
 	return true, nil
 }
 
-// copyImage copies an image from source to target using crane
+// isNotFound reports whether err represents a "doesn't exist" response from the
+// registry (e.g. an unknown repository or manifest). Registries typically return
+// a structured OCI distribution error body (NAME_UNKNOWN, MANIFEST_UNKNOWN, etc.)
+// alongside HTTP 404, and go-containerregistry's transport.Error.Error() does NOT
+// include the numeric status code in its string form when such a body is present -
+// so this checks the typed StatusCode field rather than pattern-matching err.Error().
+func isNotFound(err error) bool {
+	var terr *transport.Error
+	if errors.As(err, &terr) {
+		return terr.StatusCode == http.StatusNotFound
+	}
+	// Fall back to substring matching for errors that aren't a *transport.Error
+	return strings.Contains(err.Error(), "404") || strings.Contains(err.Error(), "not found")
+}
+
+// copyImage copies an image from source to target, pulling through the source
+// proxy (if configured) and pushing through the destination proxy (if configured)
 func (v *Vendor) copyImage(ctx context.Context, source, target string) error {
-	// Use crane to copy the image
-	err := crane.Copy(source, target, v.getCraneOptions()...)
+	srcRef, err := name.ParseReference(source)
 	if err != nil {
-		return fmt.Errorf("copying image: %w", err)
+		return fmt.Errorf("parsing source reference: %w", err)
+	}
+
+	dstRef, err := name.ParseReference(target)
+	if err != nil {
+		return fmt.Errorf("parsing target reference: %w", err)
+	}
+
+	puller, err := remote.NewPuller(v.getSourceRemoteOptions()...)
+	if err != nil {
+		return fmt.Errorf("creating puller: %w", err)
+	}
+
+	desc, err := puller.Get(ctx, srcRef)
+	if err != nil {
+		return fmt.Errorf("fetching source image: %w", err)
+	}
+
+	pusher, err := remote.NewPusher(v.getDestRemoteOptions()...)
+	if err != nil {
+		return fmt.Errorf("creating pusher: %w", err)
+	}
+
+	if err := pusher.Push(ctx, dstRef, desc); err != nil {
+		return fmt.Errorf("pushing target image: %w", err)
 	}
 
 	return nil
 }
 
-// getCraneOptions returns crane options based on configuration
-func (v *Vendor) getCraneOptions() []crane.Option {
+// getDestCraneOptions returns crane options for operations against the target registry
+func (v *Vendor) getDestCraneOptions() []crane.Option {
 	var opts []crane.Option
 
 	// Add authentication if configured
-	if v.config.Auth.Username != "" && v.config.Auth.Password != "" {
+	if v.config.Target.Auth.Username != "" && v.config.Target.Auth.Password != "" {
 		auth := &authn.Basic{
-			Username: v.config.Auth.Username,
-			Password: v.config.Auth.Password,
+			Username: v.config.Target.Auth.Username,
+			Password: v.config.Target.Auth.Password,
 		}
 		opts = append(opts, crane.WithAuth(auth))
 	} else {
@@ -503,24 +596,26 @@ func (v *Vendor) getCraneOptions() []crane.Option {
 		opts = append(opts, crane.WithAuthFromKeychain(authn.DefaultKeychain))
 	}
 
-	// Add proxy transport for source operations only
-	if v.config.SourceProxy != nil {
-		transport := v.createSourceProxyTransport()
+	// Add proxy/TLS transport for destination operations only
+	if needsCustomTransport(v.config.Target.Proxy, v.config.Target.TLSVerify) {
+		transport := v.createDestinationProxyTransport()
 		opts = append(opts, crane.WithTransport(transport))
 	}
 
 	return opts
 }
 
-// getRemoteOptions returns remote options based on configuration
-func (v *Vendor) getRemoteOptions() []remote.Option {
+// getSourceRemoteOptions returns remote options for operations against source registries
+func (v *Vendor) getSourceRemoteOptions() []remote.Option {
 	var opts []remote.Option
 
-	// Add authentication if configured
-	if v.config.Auth.Username != "" && v.config.Auth.Password != "" {
+	// Add authentication if configured for the source registry. Most sources are
+	// anonymous, so this intentionally does NOT fall back to the target's
+	// credentials - those belong to a different registry entirely.
+	if v.config.Source.Auth.Username != "" && v.config.Source.Auth.Password != "" {
 		auth := &authn.Basic{
-			Username: v.config.Auth.Username,
-			Password: v.config.Auth.Password,
+			Username: v.config.Source.Auth.Username,
+			Password: v.config.Source.Auth.Password,
 		}
 		opts = append(opts, remote.WithAuth(auth))
 	} else {
@@ -528,8 +623,8 @@ func (v *Vendor) getRemoteOptions() []remote.Option {
 		opts = append(opts, remote.WithAuthFromKeychain(authn.DefaultKeychain))
 	}
 
-	// Add proxy transport for source operations only
-	if v.config.SourceProxy != nil {
+	// Add proxy/TLS transport for source operations only
+	if needsCustomTransport(v.config.Source.Proxy, v.config.Source.TLSVerify) {
 		transport := v.createSourceProxyTransport()
 		opts = append(opts, remote.WithTransport(transport))
 	}
@@ -537,39 +632,127 @@ func (v *Vendor) getRemoteOptions() []remote.Option {
 	return opts
 }
 
-// createSourceProxyTransport creates an HTTP transport with proxy configuration for source requests
+// getDestRemoteOptions returns remote options for operations against the target registry
+func (v *Vendor) getDestRemoteOptions() []remote.Option {
+	var opts []remote.Option
+
+	// Add authentication if configured
+	if v.config.Target.Auth.Username != "" && v.config.Target.Auth.Password != "" {
+		auth := &authn.Basic{
+			Username: v.config.Target.Auth.Username,
+			Password: v.config.Target.Auth.Password,
+		}
+		opts = append(opts, remote.WithAuth(auth))
+	} else {
+		// Fall back to default keychain (Docker credentials)
+		opts = append(opts, remote.WithAuthFromKeychain(authn.DefaultKeychain))
+	}
+
+	// Add proxy/TLS transport for destination operations only
+	if needsCustomTransport(v.config.Target.Proxy, v.config.Target.TLSVerify) {
+		transport := v.createDestinationProxyTransport()
+		opts = append(opts, remote.WithTransport(transport))
+	}
+
+	return opts
+}
+
+// createSourceProxyTransport creates an HTTP transport for source requests, applying the
+// configured source proxy and/or TLS verification overrides (source.tls_verify, source.proxy.tls_verify)
 func (v *Vendor) createSourceProxyTransport() http.RoundTripper {
+	return createTransport(v.config.Source.Proxy, v.config.Source.TLSVerify)
+}
+
+// createDestinationProxyTransport creates an HTTP transport for destination (target registry)
+// requests, applying the configured destination proxy and/or TLS verification overrides
+// (target.tls_verify, target.proxy.tls_verify)
+func (v *Vendor) createDestinationProxyTransport() http.RoundTripper {
+	return createTransport(v.config.Target.Proxy, v.config.Target.TLSVerify)
+}
+
+// needsCustomTransport determines whether a non-default http.Transport must be built,
+// i.e. a proxy is configured or TLS verification has been explicitly overridden
+func needsCustomTransport(proxyCfg *config.ProxyConfig, tlsVerify *bool) bool {
+	if proxyCfg != nil {
+		return true
+	}
+	return tlsVerify != nil && !*tlsVerify
+}
+
+// createTransport builds an http.Transport from a ProxyConfig and a site-level TLS
+// verification override. siteTLSVerify set to false skips verification for the registry
+// connection; proxyCfg.TLSVerify set to false additionally skips verification for the
+// connection to the proxy itself (only meaningful when the proxy URL uses https).
+func createTransport(proxyCfg *config.ProxyConfig, siteTLSVerify *bool) *http.Transport {
 	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
 	}
 
-	if v.config.SourceProxy != nil && v.config.SourceProxy.URL != "" {
-		proxyURL, err := url.Parse(v.config.SourceProxy.URL)
-		if err == nil {
-			// Add proxy authentication if provided
-			if v.config.SourceProxy.Username != "" {
-				proxyURL.User = url.UserPassword(
-					v.config.SourceProxy.Username,
-					v.config.SourceProxy.Password,
-				)
+	insecure := siteTLSVerify != nil && !*siteTLSVerify
+
+	if proxyCfg != nil {
+		if proxyCfg.URL != "" {
+			proxyURL, err := url.Parse(proxyCfg.URL)
+			if err == nil {
+				// Add proxy authentication if provided
+				if proxyCfg.Username != "" {
+					proxyURL.User = url.UserPassword(
+						proxyCfg.Username,
+						proxyCfg.Password,
+					)
+				}
+
+				// Strip empty userinfo (e.g. a url of "http://:@proxy:8080", or
+				// username/password both left unset) so Go's transport doesn't
+				// send a present-but-empty Proxy-Authorization header - many
+				// proxies reject that as a failed auth attempt rather than
+				// treating it as anonymous. See net/http's connectMethod.proxyAuth,
+				// which sends Basic auth whenever URL.User is non-nil, regardless
+				// of whether the credentials inside it are actually empty.
+				if u := proxyURL.User; u != nil {
+					password, _ := u.Password()
+					if u.Username() == "" && password == "" {
+						proxyURL.User = nil
+					}
+				}
+
+				transport.Proxy = http.ProxyURL(proxyURL)
 			}
-			transport.Proxy = http.ProxyURL(proxyURL)
 		}
+
+		if proxyCfg.TLSVerify != nil && !*proxyCfg.TLSVerify {
+			insecure = true
+		}
+	}
+
+	if insecure {
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // explicit opt-in via tls_verify: false
 	}
 
 	return transport
 }
 
-// shouldUseProxy determines if proxy should be used for a given source URL
-func (v *Vendor) shouldUseProxy(sourceURL string) bool {
-	if v.config.SourceProxy == nil {
+// shouldUseSourceProxy determines if the source proxy should be used for a given source URL
+func (v *Vendor) shouldUseSourceProxy(sourceURL string) bool {
+	return shouldUseProxy(v.config.Source.Proxy, sourceURL)
+}
+
+// shouldUseDestinationProxy determines if the destination proxy should be used for a given target URL
+func (v *Vendor) shouldUseDestinationProxy(targetURL string) bool {
+	return shouldUseProxy(v.config.Target.Proxy, targetURL)
+}
+
+// shouldUseProxy determines if a proxy should be used for a given URL, honoring no_proxy
+func shouldUseProxy(proxyCfg *config.ProxyConfig, targetURL string) bool {
+	if proxyCfg == nil {
 		return false
 	}
 
 	// Check no_proxy list
-	for _, noProxy := range v.config.SourceProxy.NoProxy {
-		if strings.Contains(sourceURL, noProxy) {
+	for _, noProxy := range proxyCfg.NoProxy {
+		if strings.Contains(targetURL, noProxy) {
 			return false
 		}
 	}
@@ -577,14 +760,27 @@ func (v *Vendor) shouldUseProxy(sourceURL string) bool {
 	return true
 }
 
-// getProxiedHTTPClient creates an HTTP client with proxy configuration for Helm operations
-func (v *Vendor) getProxiedHTTPClient() *http.Client {
+// getSourceProxiedHTTPClient creates an HTTP client with source proxy configuration for Helm operations
+func (v *Vendor) getSourceProxiedHTTPClient() *http.Client {
 	client := &http.Client{
 		Timeout: 30 * time.Second,
 	}
 
-	if v.config.SourceProxy != nil {
+	if needsCustomTransport(v.config.Source.Proxy, v.config.Source.TLSVerify) {
 		client.Transport = v.createSourceProxyTransport()
+	}
+
+	return client
+}
+
+// getDestinationProxiedHTTPClient creates an HTTP client with destination proxy configuration for Helm operations
+func (v *Vendor) getDestinationProxiedHTTPClient() *http.Client {
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
+
+	if needsCustomTransport(v.config.Target.Proxy, v.config.Target.TLSVerify) {
+		client.Transport = v.createDestinationProxyTransport()
 	}
 
 	return client
@@ -595,13 +791,13 @@ func (v *Vendor) ListTargetImages(ctx context.Context) ([]string, error) {
 	var images []string
 
 	// Use crane's Catalog function which properly handles authentication
-	repos, err := crane.Catalog(v.config.TargetRegistry, v.getCraneOptions()...)
+	repos, err := crane.Catalog(v.config.Target.Registry, v.getDestCraneOptions()...)
 	if err != nil {
 		return nil, fmt.Errorf("listing catalog: %w", err)
 	}
 
 	// Filter repositories that start with vendor prefix
-	vendorPrefix := v.config.VendorPrefix + "/"
+	vendorPrefix := v.config.Target.Prefix + "/"
 	for _, repo := range repos {
 		if strings.HasPrefix(repo, vendorPrefix) {
 			// For each repository, list all tags
@@ -622,8 +818,8 @@ func (v *Vendor) listRepositoryTags(ctx context.Context, repo string) ([]string,
 	var images []string
 
 	// Use crane's ListTags function which properly handles authentication
-	fullRepo := fmt.Sprintf("%s/%s", v.config.TargetRegistry, repo)
-	tags, err := crane.ListTags(fullRepo, v.getCraneOptions()...)
+	fullRepo := fmt.Sprintf("%s/%s", v.config.Target.Registry, repo)
+	tags, err := crane.ListTags(fullRepo, v.getDestCraneOptions()...)
 	if err != nil {
 		return nil, fmt.Errorf("listing tags for %s: %w", repo, err)
 	}
@@ -646,13 +842,13 @@ func (v *Vendor) DeleteImage(ctx context.Context, imageRef string) error {
 	}
 
 	// Get the manifest digest first (required for deletion)
-	desc, err := remote.Get(ref, v.getRemoteOptions()...)
+	desc, err := remote.Get(ref, v.getDestRemoteOptions()...)
 	if err != nil {
 		return fmt.Errorf("getting manifest: %w", err)
 	}
 
 	// Delete using the digest
-	err = remote.Delete(ref, v.getRemoteOptions()...)
+	err = remote.Delete(ref, v.getDestRemoteOptions()...)
 	if err != nil {
 		return fmt.Errorf("deleting image: %w", err)
 	}

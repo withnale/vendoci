@@ -37,16 +37,17 @@ go install github.com/rhodesp/vendoci/cmd/vendoci@latest
 Create a `.vendoci.yaml` configuration file:
 
 ```yaml
-# Target registry where images will be vendored
-target_registry: "myregistry.example.com"
+target:
+  # Target registry where images will be vendored
+  registry: "myregistry.example.com"
 
-# Prefix for vendored images (default: "vendor")
-vendor_prefix: "vendor"
+  # Prefix for vendored images (default: "vendor")
+  prefix: "vendor"
 
-# Authentication for the target registry
-auth:
-  username: "your-username"
-  password_env: "VENDOCI_PASSWORD"  # Use environment variable for password
+  # Authentication for the target registry
+  auth:
+    username: "your-username"
+    password_env: "VENDOCI_PASSWORD"  # Use environment variable for password
 
 # Images to vendor
 images:
@@ -129,10 +130,17 @@ vendoci sync --images docker.io/ubuntu --tags latest,20.04
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `target_registry` | string | Target registry URL (required) |
-| `vendor_prefix` | string | Prefix for vendored images (default: "vendor") |
+| `target.registry` | string | Target registry URL (required) |
+| `target.prefix` | string | Prefix for vendored images (default: "vendor") |
+| `target.auth` | object | Authentication configuration |
+| `target.proxy` | object | Proxy configuration for target registry requests (optional) |
+| `target.tls_verify` | bool | Set to `false` to skip TLS certificate verification for the target registry (default: `true`) |
+| `source.auth` | object | Authentication for source registries (optional - most sources are anonymous; falls back to the local Docker credential store/keychain when unset) |
+| `source.proxy` | object | Proxy configuration for source registry/Helm-repo requests (optional) |
+| `source.tls_verify` | bool | Set to `false` to skip TLS certificate verification for source registries/Helm repos (default: `true`) |
 | `images` | array | List of image configurations |
-| `auth` | object | Authentication configuration |
+
+See [PROXY_SUPPORT.md](./PROXY_SUPPORT.md) for full proxy and TLS verification details.
 
 ### Image Configuration
 
@@ -157,12 +165,12 @@ vendoci sync --images docker.io/ubuntu --tags latest,20.04
 ### Corporate Environment
 
 ```yaml
-target_registry: "artifacts.company.com"
-vendor_prefix: "vendor"
-
-auth:
-  username: "build-system"
-  password_env: "REGISTRY_PASSWORD"
+target:
+  registry: "artifacts.company.com"
+  prefix: "vendor"
+  auth:
+    username: "build-system"
+    password_env: "REGISTRY_PASSWORD"
 
 images:
   # Base images for CI/CD
@@ -184,8 +192,9 @@ images:
 ### Development Environment
 
 ```yaml
-target_registry: "localhost:5000"
-vendor_prefix: "dev"
+target:
+  registry: "localhost:5000"
+  prefix: "dev"
 
 images:
   - source: "docker.io/nginx"

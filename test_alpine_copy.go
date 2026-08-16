@@ -24,11 +24,13 @@ func main() {
 
 	// Create configuration
 	cfg := &config.Config{
-		TargetRegistry: "ghcr.io/poptart-testing/poptart",
-		VendorPrefix:   "vendor",
-		Auth: config.AuthConfig{
-			Username: "poptart-testing",
-			Password: githubToken,
+		Target: config.TargetConfig{
+			Registry: "ghcr.io/poptart-testing/poptart",
+			Prefix:   "vendor",
+			Auth: config.AuthConfig{
+				Username: "poptart-testing",
+				Password: githubToken,
+			},
 		},
 		Images: []config.ImageConfig{
 			{

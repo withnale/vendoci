@@ -1,0 +1,60 @@
+# Git
+.git
+.gitignore
+
+# Build artifacts
+vendoci
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.html
+coverage.out
+
+# Go
+*.log
+vendor/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Docker
+docker-compose.yml
+docker-compose.override.yml
+Dockerfile
+.dockerignore
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+.travis.yml
+
+# Documentation (if not needed in image)
+*.md
+docs/
+
+# Test files
+*_test.go
+test_*.go
+testdata/
+
+# Config files (usually provided at runtime)
+.vendoci*.yaml
+vendoci*.yaml
+.env
+.env.*
