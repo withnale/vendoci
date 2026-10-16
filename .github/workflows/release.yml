@@ -37,7 +37,10 @@ jobs:
             go build -trimpath -ldflags "${LDFLAGS}" \
             -o dist/vendoci-darwin-arm64 ./cmd/vendoci
 
-          GOOS=linux GOARCH=amd64 \
+          # Build a static Linux binary so it does not require the runner's
+          # glibc version (the GitHub-hosted runner currently emits GLIBC_2.34
+          # references that are unavailable on older supported distributions).
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
             go build -trimpath -ldflags "${LDFLAGS}" \
             -o dist/vendoci-linux-amd64 ./cmd/vendoci
 
